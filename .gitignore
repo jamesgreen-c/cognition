@@ -3,6 +3,12 @@ __pycache__/
 *.py[codz]
 *$py.class
 
+# ignore results and plots
+plots/
+results/
+deprecated/
+
+
 # C extensions
 *.so
 
