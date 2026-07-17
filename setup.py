@@ -42,13 +42,13 @@ README = (HERE / "README.md").read_text(encoding="utf-8")
 INSTALL_REQUIRES = read_requirements("requirements.txt")
 
 setup(
-    name="RP-PS",
+    name="Cognition",
     version="0.1.1",
-    description="Non-linear dynamical system learning with recognition.",
+    description="SLAC-like control informed RP GSSM representation learning",
     long_description=README,
     long_description_content_type="text/markdown",
     author="James Green",
-    url="https://github.com/jamesgreen-c/RP-PS",
+    url="https://github.com/jamesgreen-c/cognition",
     license="MIT",
     packages=find_packages(),
     python_requires="==3.12.3",
@@ -58,14 +58,12 @@ setup(
     keywords=[
         "jax",
         "state-space-models",
-        "monte-carlo",
-        "particle-filter",
-        "particle-smoother",
-        "particle-mcmc",
-        "bayesian",
         "recognition",
         "variational-optimisation",
         "expectation-maximisation"
+        "reinforcement-learning",
+        "actor-critic",
+        "control"
     ],
 )
 
