@@ -1,15 +1,20 @@
 import optax
+
 import jax
 import jax.random as jr
 import jax.numpy as jnp
 
-from jax import Array
 from tqdm import tqdm
+from typing import Callable, Any
+
+from jax import Array
+
 from rp_ssm.free_energy import ConstrainedIVFreeEnergy
 from rp_ssm.config import Config
-from typing import Callable, Any
 from rp_ssm.distributions import AllParams
-from rp_ssm import utils
+
+from rp_ssm.utils.linreg import linear_r2
+from rp_ssm.utils.math import scale_sv, clip_sv
 
 
 EPS = 1e-3
@@ -96,7 +101,7 @@ class Trainer:
                 self.best_loss = loss
                 self.best_params = self.params
             
-            self._stabilize_params()
+            self._stabilise_params()
 
             self.loss_tot.append(loss)
             to_print = self.logger(self, aux, batch_indices) # TODO: validation step?
@@ -106,7 +111,7 @@ class Trainer:
 
             if y is not None and self.itr % 100 == 0:
                 x = self.apply((data[0], ))[1].params["means"]
-                r2 = utils.linear_r2(x, y)
+                r2 = linear_r2(x, y)
                 self.r2_history.append(r2)
 
     def train_continue(self, data: tuple[Array], new_iter: int, key: Array):
@@ -122,18 +127,18 @@ class Trainer:
                 self.params, self.opt_states, data_batch
             )
             
-            self._stabilize_params()
+            self._stabilise_params()
 
             self.loss_tot.append(loss)
             self.logger(self, aux, batch_indices) # TODO: validation step?
             R2s = ','.join(f'{r:.2f}' for r in self.r2[-1])
             pbar.set_postfix(loss=f'{loss:.3f}', R2=R2s)
 
-    def _stabilize_params(self):
-        if self.config.stabilize_A == 'scale':
-            self.params[0]['A'] = utils.scale_sv(self.params[0]['A'], EPS)
-        elif self.config.stabilize_A == 'clip':
-            self.params[0]['A'] = utils.clip_sv(self.params[0]['A'], EPS)
+    def _stabilise_params(self):
+        if self.config.stabilise_A == 'scale':
+            self.params[0]['A'] = scale_sv(self.params[0]['A'], EPS)
+        elif self.config.stabilise_A == 'clip':
+            self.params[0]['A'] = clip_sv(self.params[0]['A'], EPS)
 
     def apply(self, data: tuple[Array]) -> None:
         prior_params, *rec_params = self.params

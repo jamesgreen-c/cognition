@@ -2,12 +2,17 @@ import jax
 import jax.numpy as jnp
 import flax.linen as nn
 
-from jax import vmap
-from rp_ssm import utils
-from jax.scipy.linalg import solve_triangular
 from typing import Any, Union, Tuple, Optional
+
+from jax import vmap
+from jax.scipy.linalg import solve_triangular
 from flax.core.frozen_dict import FrozenDict
+
 from tensorflow_probability.substrates.jax.distributions import MultivariateNormalFullCovariance as MVN
+
+from rp_ssm.utils.vmapping import auto_vmap
+from rp_ssm.utils.math import spd_inverse, inv_quad_form, inv_quad_form_symmetric
+
 
 
 from typing import TYPE_CHECKING, Sequence
@@ -187,9 +192,9 @@ class GaussianNatParam(NatParam):
         return self.params['pwm'].shape[-1]
 
     @property
-    @utils.auto_vmap('pwm', 1)
+    @auto_vmap('pwm', 1)
     def dist_param(self):
-        cov = utils.spd_inverse(self.params['p'])
+        cov = spd_inverse(self.params['p'])
         mean = cov @ self.params['pwm']
         return GaussianDistParam(
             dist_map=None,
@@ -199,11 +204,11 @@ class GaussianNatParam(NatParam):
 
     @property
     def lognormalizer(self):
-        quad, det = utils.inv_quad_form_symmetric(self.params['p'], self.params['pwm'])
+        quad, det = inv_quad_form_symmetric(self.params['p'], self.params['pwm'])
         return 0.5 * (quad - det)
     
     def expsuffstat_dot(self, v):
-        term1 = utils.inv_quad_form(self.params['p'], self.params['pwm'], v.params['pwm'])
+        term1 = inv_quad_form(self.params['p'], self.params['pwm'], v.params['pwm'])
         L = jnp.linalg.cholesky(self.params['p'])
         first = solve_triangular(
             L.T,
@@ -225,9 +230,9 @@ class GaussianDistParam(DistParam):
     # cov: Array
 
     @property
-    @utils.auto_vmap('mean', 1)
+    @auto_vmap('mean', 1)
     def nat_param(self) -> GaussianNatParam:
-        p = utils.spd_inverse(self.params['cov'])
+        p = spd_inverse(self.params['cov'])
         pwm = p @ self.params['mean']
         return GaussianNatParam(
             dist_map=None,
@@ -247,7 +252,7 @@ class GaussianDistParam(DistParam):
         """
         assert x.shape == self.params["mean"].shape
         if self.params["cov"].ndim == 2:
-            inv_quad_form, logdet = utils.inv_quad_form_symmetric(
+            inv_quad_form, logdet = inv_quad_form_symmetric(
                 self.params["cov"], x - self.params["mean"]
             )
         elif self.params["cov"].ndim == 1:

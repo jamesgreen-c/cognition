@@ -1,13 +1,7 @@
-import os
-import jax.random as jr
 import jax.numpy as jnp
-from rp_ssm import datasets_utils
+
 from flax.struct import dataclass
 from jax import Array
-from pathlib import Path
-
-
-ROOT_DIR = '/ceph/scratch/samoh/rp_ssm'
 
 
 @dataclass
@@ -19,7 +13,7 @@ class Dataset:
     params: dict[str, Array]
 
     @property
-    def standardized_data(self):
+    def standardised_data(self):
         means = tuple(jnp.mean(d, axis=(0,1), keepdims=True) for d in self.train_data)
         stds = tuple(jnp.std(d, axis=(0,1), keepdims=True) for d in self.train_data)
         scaled_train_data = tuple((d-m)/s for d, m, s in zip(self.train_data, means, stds))

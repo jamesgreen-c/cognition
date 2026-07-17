@@ -17,7 +17,7 @@ class Config:
     prior_opt: Callable = optax.adam
     prior_lr: LearningRate = 1e-3
     rec_lr: tuple[LearningRate, ...] = (1e-3,)
-    stabilize_A: Optional[str] = 'scale'
+    stabilise_A: Optional[str] = 'scale'
     em: bool = False  # if True, perform EM (don't backprop through posterior)
 
     # adaptive learning rate decay
