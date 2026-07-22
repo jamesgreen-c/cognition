@@ -33,7 +33,7 @@ class CriticNetwork(nn.Module):
     def __call__(self, x: Array):
         x = self.network(x)
         x = nn.Dense(1, kernel_init=self.kernel_init, bias_init=self.bias_init)(x)
-        return x
+        return jnp.squeeze(x, axis=-1)
 
 
 class Critic:
@@ -46,20 +46,19 @@ class Critic:
         Parameters
         ----------
         key:   PRNGKey
-        data:  (N, D) Example input vector (any posterior mean from RPSSM)
+        data:  (D) Example input vector (any posterior mean from RPSSM)
         """
-        params = self.network.init(key, data[0, 0])
+        params = self.network.init(key, data)
         return params
     
-    def get_values(self, params, data: Array):
+    def apply(self, params, data: Array):
         """
         Parameters
         ----------
         params:  Network parameters
         data:    (N, D) The current posterior means from the RPSSM to estimate values for
         """
-        outs = vmap(lambda x: self.network.apply(params, x))(data)
-        return outs
+        return self.network.apply(params, data)
     
 
 
