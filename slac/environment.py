@@ -106,3 +106,20 @@ class Environment(ABC):
         next_state:  The next state of the environment
         """
         pass
+
+    @abstractmethod
+    def observe(self, key: PRNGKey, state: Array):
+        """
+        Implement observation of env state. 
+        Ie could be exactly the environment state with no noise, could be an image generator etc
+        
+        Parameters
+        ---------- 
+        key:     PRNGKey
+        state:   (*D) current state of the environment
+
+        Returns
+        ------- 
+        observation:  The observation to be passed to RPM
+        """
+        pass
