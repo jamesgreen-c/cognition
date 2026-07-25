@@ -16,6 +16,8 @@ from slac.environment import Environment
 def angle_normalise(theta):
     return (theta + jnp.pi) % (2.0 * jnp.pi) - jnp.pi
 
+def random_policy(key, state):
+    return jr.choice(key, jnp.array([-1.0, 1.0]))
 
 # ===== data generation =====
 
@@ -54,6 +56,23 @@ class PendulumEnvironment(Environment):
         # noise on cart and angular velocities if not provided.
         self.process_std = jnp.array([0.0, 0.002, 0.0, 0.005]) if process_std is None else process_std
 
+
+    def observe(self, key: PRNGKey, state: Array):
+        """
+        Implement the observation model. 
+        Could return the true state or a transformation (such as an image)
+
+        Parameters
+        ----------
+        key:    PRNGKey
+        state:  Current environment state
+
+        Returns
+        -------
+        observation:  Observation to be passed to recognition network.
+        """
+        return state
+    
 
     def model(self, key: PRNGKey, state: Array, action: Array):
         """
@@ -160,51 +179,52 @@ Generating pendulum data:
     environment = PendulumEnvironment(T=T)
 
     # sample latent states using policy
-    _, latent_sample, actions = environment.sample(
+    _, latent_sample, obs_samples, actions = environment.sample(
         state_key,
         initial_state,
         policy,
         num_samples=M,
     )
-
+    print(obs_samples.shape)
+    print(latent_sample.shape)
     # sample observations
-    D = latent_sample.shape[-1]
-    emission_params = {
-        "C": jr.normal(key_C, shape=(J, D, D)),
-        "d": jr.normal(key_d, shape=(J, D)),
-        "R": jnp.broadcast_to(emission_cov * jnp.eye(D), (J, D, D)),
-    }
+    # D = latent_sample.shape[-1]
+    # emission_params = {
+    #     "C": jr.normal(key_C, shape=(J, D, D)),
+    #     "d": jr.normal(key_d, shape=(J, D)),
+    #     "R": jnp.broadcast_to(emission_cov * jnp.eye(D), (J, D, D)),
+    # }
 
-    def sample_single_factor(C, d, R, key):
-        means = latent_sample @ C.T + d
-        noise = jr.multivariate_normal(key, jnp.zeros(D), R, shape=(M, T))
-        return means + noise
+    # def sample_single_factor(C, d, R, key):
+    #     means = latent_sample @ C.T + d
+    #     noise = jr.multivariate_normal(key, jnp.zeros(D), R, shape=(M, T))
+    #     return means + noise
 
-    obs_samples = vmap(sample_single_factor)(
-        emission_params["C"],
-        emission_params["d"],
-        emission_params["R"],
-        jr.split(obs_key, J),
-    )
+    # obs_samples = vmap(sample_single_factor)(
+    #     emission_params["C"],
+    #     emission_params["d"],
+    #     emission_params["R"],
+    # #     jr.split(obs_key, J),
+    # # )
 
-    # TODO make params look like this - use Q in environment.sample
-    params = {
-            'm1': np.zeros(K),
-            'Q1': np.eye(K),
-            
-            'A': np.eye(K), # no dynamics (random walk)
-            'b': np.zeros(K),
-            'Q': np.eye(K), # independent noise
-            'R': np.eye(D) * np.sqrt(emission_cov) # keep R constant across J for now
-        }
+    # # TODO make params look like this - use Q in environment.sample
+    # params = {
+    #     'm1': jnp.zeros(D),
+    #     'Q1': jnp.eye(D),
+        
+    #     'A': jnp.eye(D), # no dynamics (random walk)
+    #     'b': jnp.zeros(D),
+    #     'Q': jnp.eye(D), # independent noise
+    #     'R': jnp.eye(D) * jnp.sqrt(emission_cov) # keep R constant across J for now
+    # }
     
     return Dataset(
-        train_data=tuple(o[:N] for o in obs_samples),
+        train_data=(obs_samples[:N], ),
         train_states=latent_sample[:N],
-        val_data=tuple(o[N:] for o in obs_samples),
+        val_data=(obs_samples[N:], ),
         val_states=latent_sample[N:],
         params={
-            **emission_params,
+            # **emission_params,
             "train_actions": actions[:N],
             "val_actions": actions[N:],
         },

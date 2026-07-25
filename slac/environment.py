@@ -59,17 +59,21 @@ class Environment(ABC):
 
     def _sample_single(self, key: PRNGKey, state_0: Array, policy: Callable):
         """Generate one trajectory containing T states."""
-        step_keys = jr.split(key, self.T - 1)
+        obs_key, step_key = jr.split(key)
+        step_keys = jr.split(step_key, self.T - 1)
 
+        obs_0 = self.observe(obs_key, state_0)
         def scan_step(state, key):
-            policy_key, transition_key = jr.split(key)
+            policy_key, transition_key, observation_key = jr.split(key, 3)
             action = policy(policy_key, state)
             next_state = self.transition(transition_key, state, action)
-            return next_state, (next_state, action)
+            next_obs = self.observe(observation_key, next_state)
+            return next_state, (next_state, next_obs, action)
 
-        final_state, (subsequent_states, actions) = lax.scan(scan_step, state_0, step_keys)
-        states = jnp.concatenate([state_0[None], subsequent_states], axis=0)
-        return final_state, states, actions
+        final_state, (states, observations, actions) = lax.scan(scan_step, state_0, step_keys)
+        states = jnp.concatenate([state_0[None], states], axis=0)
+        observations = jnp.concatenate([obs_0[None], observations], axis=0)
+        return final_state, states, observations, actions
 
     @abstractmethod
     def transition(self, key: PRNGKey, state: Array, action: Array):
