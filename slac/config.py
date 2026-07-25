@@ -46,21 +46,14 @@ class Config:
     Training configuration for recognition and prior optimisation.
     """
     num_iter: int = 100
-    seed: int = 0
 
+    reward_lr = 1e-2
+    actor_trace_decay = 1e-1
+    critic_trace_decay = 1e-1
+
+    seed: int = 0
     debug: bool = False
 
-    actor: OptimConfig = field(
-        default_factory=lambda: OptimConfig(
-            optimizer=optax.adam,
-            lr=1e-3,
-        )
-    )
-
-    critic: OptimConfig = field(
-        default_factory=lambda: OptimConfig(
-            optimizer=optax.adam,
-            lr=1e-3,
-        )
-    )
+    actor: OptimConfig = field(default_factory=lambda: OptimConfig(optimizer=optax.adam, lr=1e-3))
+    critic: OptimConfig = field(default_factory=lambda: OptimConfig(optimizer=optax.adam, lr=1e-3))
 
