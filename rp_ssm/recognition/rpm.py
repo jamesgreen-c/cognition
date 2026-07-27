@@ -96,7 +96,7 @@ class RPSSM:
         factors_nat = type(outs[0])(**{k: jnp.stack([out.params[k] for out in outs]) for k in outs[0].params.keys()}) # JxBxK
         factors = AllParam(factors_nat.sum(axis=0)) # BxK
 
-        return initial_filter_distribution(prior, factors, self.latent_dim)
+        return initial_filter_distribution(prior, factors.dist_param, self.latent_dim)
 
     def filter(self, params, posterior, data):
         """ 
@@ -115,7 +115,7 @@ class RPSSM:
         factors_nat = type(outs[0])(**{k: jnp.stack([out.params[k] for out in outs]) for k in outs[0].params.keys()}) # JxBxK
         factors = AllParam(factors_nat.sum(axis=0)) # BxK
 
-        return next_filter_distribution(prior, posterior, factors, self.latent_dim)
+        return next_filter_distribution(prior, posterior, factors.dist_param, self.latent_dim)
 
     def rollout(
             self, 
