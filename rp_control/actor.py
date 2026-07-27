@@ -19,9 +19,11 @@ import flax.linen as nn
 from typing import Callable
 
 from jax import vmap, Array
+from jax.lax import stop_gradient as stop_grad
 from jax.random import PRNGKey
 
-from rp_ssm.distributions import DistMap, NatParam
+from rp_ssm.distributions import NatParam
+from rp_ssm.recognition.distmaps import DistMap
 
 
 INITIALIZER = jax.nn.initializers.variance_scaling(
@@ -77,7 +79,10 @@ class Actor:
         nat_params = self.network.apply(params, data)
         dist = nat_params.dist_param
 
-        action = dist.sample(key=key, action_shape=self.action_shape)
+        action = dist.sample(key=key, shape=self.action_shape)
+        # action = jnp.clip(action, min=-1.0, max=1.0)
+        action = stop_grad(action)
+        
         log_prob = dist.log_prob(action)
 
         return log_prob, action

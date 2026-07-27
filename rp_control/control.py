@@ -37,6 +37,8 @@ from rp_control.loss import ActorCriticLoss
 from rp_control.config import Config
 from rp_control.environment import Environment
 
+from rp_ssm.utils.dataset import Dataset
+
 
 class ActorCritic:
 
@@ -59,6 +61,8 @@ class ActorCritic:
         self.env = environment
 
         self.itr = 0
+        self.fitted = False
+        self.reward_hist = None
 
     def train_step(
             self,
@@ -93,7 +97,8 @@ class ActorCritic:
         """
 
         # apply actor and critic independently to each sequence using shared parameters
-        grads, aux = jax.vmap(self.loss.grads, in_axes=(0, None, 0, 0))(keys, params, posteriors, env_states)
+        # grads, aux = jax.vmap(self.loss.grads, in_axes=(0, None, 0, 0))(keys, params, posteriors, env_states)
+        grads, aux = self.loss.grads(keys, params, posteriors, env_states)
         next_posteriors, next_env_states, rewards, next_values, values = aux
 
         # continuing discounted eligibility trace updates
@@ -112,7 +117,32 @@ class ActorCritic:
 
         return new_params, new_opt_states, next_posteriors, next_env_states, traces, rewards, deltas
 
-    def fit(self, rpm_params):
+    def episode(self, key, posteriors, initial_states, traces, discount):
+
+        def _body(carry, _keys):
+            _params, _opt_states, _posts, _envs, _traces, _discount = carry
+
+            # apply batched RL step
+            outs = self.train_step(_keys, _params, _opt_states, _traces, _discount, _posts, _envs)
+            _params_p1, _opt_states_p1, _posts_p1, _envs_p1, _traces_p1, rewards, deltas = outs
+
+            # update actor discount
+            _discount_p1 = self.config.gamma * _discount
+
+            # pack next carry
+            carry_p1 = (_params_p1, _opt_states_p1, _posts_p1, _envs_p1, _traces_p1, _discount_p1)
+            return carry_p1, (rewards, deltas)
+
+        # initial carry and inputs
+        carry_0 = (self.params, self.opt_states, posteriors, initial_states, traces, discount)
+        keys = jr.split(key, (self.env.T - 1, self.config.batch_size))
+
+        # rewards, deltas: (T - 1, B, ...)
+        (params, opt_states, *_), (rewards, deltas) = jax.lax.scan(_body, carry_0, keys)
+        return  params, opt_states, rewards, deltas
+    
+
+    def fit(self, data: tuple[Array], rpm_params):
         """
         Trains the actor and critic using B parallel rollout sequences
 
@@ -123,26 +153,29 @@ class ActorCritic:
 
         Parameters
         ----------
-        rpm_params:  trained RPSSM parameters held fixed during actor-critic training
+        data:        Non-standardised training data
+        rpm_params:  Trained RPSSM parameters held fixed during actor-critic training
 
         Returns
         -------
-        params:  trained actor and critic parameters with unchanged RPSSM parameters
+        params:  Trained actor and critic parameters with unchanged RPSSM parameters
         """
 
-        train_step = jax.jit(self.train_step) if not self.config.debug else self.train_step
+        self.fitted = True
+
+        # train_step = jax.jit(self.train_step) if not self.config.debug else self.train_step
+        train_episode = jax.jit(self.episode) if not self.config.debug else self.episode
         B = self.config.batch_size
 
         # init shared params
         key, init_key, obs_key, param_key = jr.split(jr.PRNGKey(self.config.seed), 4)
-        dummy_state = self.env.initial_state(init_key)
-        dummy_obs = self.env.observe(obs_key, dummy_state)
-        self.params = self.loss.init(param_key, dummy_obs, rpm_params)
+        self.params = self.loss.init(param_key, data, rpm_params)
         self.opt_states = {
             "actor": self.actor_opt.init(self.params["actor"]),
             "critic": self.critic_opt.init(self.params["critic"])
         }
 
+        self.reward_hist = []
         pbar = tqdm(range(self.config.num_iter))
         for self.itr in pbar:
 
@@ -155,9 +188,7 @@ class ActorCritic:
             initial_obs = jax.vmap(self.env.observe)(obs_keys, initial_states)
 
             # apply RPM to initial data
-            posteriors = jax.vmap(
-                self.loss.get_initial_distribution, in_axes=(None, 0)
-            )(self.params, initial_obs)
+            posteriors = self.loss.get_initial_distribution(self.params, initial_obs)  # mean: (B, D)
 
             # separate eligibility traces for every sequence
             discount = jnp.array(1.0)
@@ -166,33 +197,82 @@ class ActorCritic:
                 "critic": tree_map(lambda p: jnp.zeros((B,) + p.shape), self.params["critic"])
             }
 
-            def _body(carry, _keys):
-                _params, _opt_states, _posts, _envs, _traces, _discount = carry
+            self.params, self.opt_states, rewards, deltas = train_episode(episode_key, 
+                                                                          posteriors, 
+                                                                          initial_states, 
+                                                                          traces, 
+                                                                          discount)
 
-                # apply batched RL step
-                outs = train_step(_keys, _params, _opt_states, _traces, _discount, _posts, _envs)
-                _params_p1, _opt_states_p1, _posts_p1, _envs_p1, _traces_p1, rewards, deltas = outs
-
-                # update actor discount
-                _discount_p1 = self.config.gamma * _discount
-
-                # pack next carry
-                carry_p1 = (_params_p1, _opt_states_p1, _posts_p1, _envs_p1, _traces_p1, _discount_p1)
-                return carry_p1, (rewards, deltas)
-
-            # initial carry and inputs
-            carry_0 = (self.params, self.opt_states, posteriors, initial_states, traces, discount)
-            keys = jr.split(episode_key, (self.env.T - 1, B))
-
-            # rewards, deltas: (T - 1, B, ...)
-            carry, (rewards, deltas) = jax.lax.scan(_body, carry_0, keys)
-            self.params, self.opt_states = carry[:2]
-
+            # logging
             mean_return = jnp.mean(jnp.sum(rewards, axis=0))
             mean_delta = jnp.mean(jnp.abs(deltas))
             pbar.set_postfix(reward=float(mean_return), delta=float(mean_delta))
 
+            self.reward_hist.append(mean_return)
+
         return self.params
+
+    def fit_continue(self, new_rpm_params, new_iter: int, key: Array):
+        """
+        Continues actor-critic training without reinitialising parameters
+
+        Each iteration initialises B independent sequences and applies online
+        actor-critic updates over T - 1 timesteps. Parameters and optimiser states
+        are continued from the preceding fit call, while posteriors, environment
+        states and eligibility traces are initialised for each new rollout.
+
+        Parameters
+        ----------
+        new_iter: number of additional batched rollout iterations
+        key:      PRNG key used to initialise and simulate the new rollouts
+
+        Returns
+        -------
+        params: updated actor, critic and unchanged RPSSM parameters
+        """
+        assert self.fitted, "Use method ActorCritic.fit() before fit_continue()"
+
+        train_episode = jax.jit(self.episode) if not self.config.debug else self.episode
+        B = self.config.batch_size
+        self.params["rpm"] = new_rpm_params
+
+        pbar = tqdm(range(self.itr, self.itr + new_iter))
+        for self.itr in pbar:
+
+            # sample B starting states and observations
+            key, init_key, obs_key, episode_key = jr.split(key, 4)
+            init_keys = jr.split(init_key, B)
+            obs_keys = jr.split(obs_key, B)
+
+            initial_states = jax.vmap(self.env.initial_state)(init_keys)
+            initial_obs = jax.vmap(self.env.observe)(obs_keys, initial_states)
+
+            # apply RPM to initial data
+            posteriors = self.loss.get_initial_distribution(self.params, initial_obs)  # mean: (B, D)
+
+            # separate eligibility traces for every sequence
+            discount = jnp.array(1.0)
+            traces = {
+                "actor": tree_map(lambda p: jnp.zeros((B,) + p.shape), self.params["actor"]),
+                "critic": tree_map(lambda p: jnp.zeros((B,) + p.shape), self.params["critic"])
+            }
+
+            self.params, self.opt_states, rewards, deltas = train_episode(episode_key, 
+                                                                          posteriors, 
+                                                                          initial_states, 
+                                                                          traces, 
+                                                                          discount)
+
+            # logging
+            mean_return = jnp.mean(jnp.sum(rewards, axis=0))
+            mean_delta = jnp.mean(jnp.abs(deltas))
+            pbar.set_postfix(reward=float(mean_return), delta=float(mean_delta))
+
+            self.reward_hist.append(mean_return)
+
+        self.itr += 1
+        return self.params
+
 
     def generate(self, key, N: int):
         """
@@ -201,14 +281,25 @@ class ActorCritic:
         Parameters
         ----------
         key:   PRNGkey used to generate the trajectories
-        N:     Number of independent trajectories
+        N:     Number of independent training trajectories
 
         Returns
         -------
-        data:  N generated trajectories containing states, observations and actions
+        data:  Generated trajectories containing states, observations and actions
         """
-        keys = jr.split(key, N)
-        return jax.vmap(lambda _key: self.loss.episode(_key, self.params))(keys)
+        M = N + N // 4      # 25% extra for validation data
+        latent_samples, obs_samples, actions = self.loss.episode(key, self.params, M)
+
+        return Dataset(
+            train_data=(obs_samples[:N],),
+            train_states=latent_samples[:N],
+            val_data=(obs_samples[N:],),
+            val_states=latent_samples[N:],
+            params={
+                "train_actions": actions[:N],
+                "val_actions": actions[N:],
+            },
+        )
 
     def _update_trace(self, decay_rate, trace, gradient):
         """

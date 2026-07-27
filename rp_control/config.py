@@ -48,8 +48,8 @@ class Config:
     batch_size: int = 32
 
     gamma: float = 0.99
-    actor_trace_decay: float = 0.1
-    critic_trace_decay: float = 0.1
+    actor_trace_decay: float = 0.9
+    critic_trace_decay: float = 0.9
 
     seed: int = 0
     debug: bool = False
