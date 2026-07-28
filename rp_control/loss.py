@@ -37,6 +37,8 @@ class ActorCriticLoss:
         actor_init_key, critic_init_key = jr.split(key)
         posterior = self.rpm.initial_distribution(rpm_params, (data[0][0], ))
         mean = posterior.params["mean"]
+
+        # TODO test on observation
         _actor_params = self.actor.init(actor_init_key, mean)
         _critic_params = self.critic.init(critic_init_key, mean)
 

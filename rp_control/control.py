@@ -39,6 +39,10 @@ from rp_control.environment import Environment
 
 from rp_ssm.utils.dataset import Dataset
 
+def tree_norm(tree):
+    return jnp.sqrt(sum(
+        jnp.sum(x ** 2) for x in jax.tree_util.tree_leaves(tree)
+    ))
 
 class ActorCritic:
 
@@ -109,6 +113,16 @@ class ActorCritic:
         actor_loss = self._mean_trace_update(traces["actor"], deltas)
         critic_loss = self._mean_trace_update(traces["critic"], deltas)
 
+        jax.debug.print(
+            "reward {r:.4f} | delta {d:.4f} ± {ds:.4f} | "
+            "weighted actor {ag:.4e} | weighted critic {cg:.4e} | ",
+            r=jnp.mean(rewards),
+            d=jnp.mean(deltas),
+            ds=jnp.std(deltas),
+            ag=tree_norm(actor_loss),
+            cg=tree_norm(critic_loss)
+        )
+
         # apply one shared semi-gradient update
         new_params, new_opt_states = self._update_params(actor_loss=actor_loss,
                                                          critic_loss=critic_loss,
@@ -117,7 +131,7 @@ class ActorCritic:
 
         return new_params, new_opt_states, next_posteriors, next_env_states, traces, rewards, deltas
 
-    def episode(self, key, posteriors, initial_states, traces, discount):
+    def episode(self, key, params, opt_states, posteriors, initial_states, traces, discount):
 
         def _body(carry, _keys):
             _params, _opt_states, _posts, _envs, _traces, _discount = carry
@@ -134,7 +148,7 @@ class ActorCritic:
             return carry_p1, (rewards, deltas)
 
         # initial carry and inputs
-        carry_0 = (self.params, self.opt_states, posteriors, initial_states, traces, discount)
+        carry_0 = (params, opt_states, posteriors, initial_states, traces, discount)
         keys = jr.split(key, (self.env.T - 1, self.config.batch_size))
 
         # rewards, deltas: (T - 1, B, ...)
@@ -197,7 +211,9 @@ class ActorCritic:
                 "critic": tree_map(lambda p: jnp.zeros((B,) + p.shape), self.params["critic"])
             }
 
-            self.params, self.opt_states, rewards, deltas = train_episode(episode_key, 
+            self.params, self.opt_states, rewards, deltas = train_episode(episode_key,
+                                                                          self.params,
+                                                                          self.opt_states,
                                                                           posteriors, 
                                                                           initial_states, 
                                                                           traces, 
@@ -257,7 +273,9 @@ class ActorCritic:
                 "critic": tree_map(lambda p: jnp.zeros((B,) + p.shape), self.params["critic"])
             }
 
-            self.params, self.opt_states, rewards, deltas = train_episode(episode_key, 
+            self.params, self.opt_states, rewards, deltas = train_episode(episode_key,
+                                                                          self.params,
+                                                                          self.opt_states,
                                                                           posteriors, 
                                                                           initial_states, 
                                                                           traces, 
@@ -399,6 +417,12 @@ class ActorCritic:
         )
         critic_update, critic_opt_state = self.critic_opt.update(
             critic_loss, opt_states["critic"], params["critic"]
+        )
+
+        jax.debug.print(
+            "actor update {au:.4e} | critic update {cu:.4e}",
+            au=tree_norm(actor_update),
+            cu=tree_norm(critic_update),
         )
 
         actor_params = optax.apply_updates(params["actor"], actor_update)
