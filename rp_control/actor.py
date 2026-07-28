@@ -79,11 +79,17 @@ class Actor:
         nat_params = self.network.apply(params, data)
         dist = nat_params.dist_param
 
-        action = dist.sample(key=key, shape=self.action_shape)
+        # action = dist.sample(key=key, shape=self.action_shape)
         # action = jnp.clip(action, min=-1.0, max=1.0)
-        action = stop_grad(action)
-        
-        log_prob = dist.log_prob(action)
+        # action = stop_grad(action)
+        # log_prob = dist.log_prob(action)
+
+        raw_action = dist.sample(key=key, shape=self.action_shape)
+        raw_action = stop_grad(raw_action)
+
+        action = jnp.tanh(raw_action)
+        log_prob = dist.log_prob(raw_action)
+        log_prob -= jnp.sum(jnp.log(1.0 - action ** 2 + 1e-6))
 
         return log_prob, action
 
