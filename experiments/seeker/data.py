@@ -56,11 +56,13 @@ class CentreSeekingEnvironment(Environment):
             jnp.sin(position),
             jnp.cos(position),
         ])
+        # return state /
 
     def transition(self, key: PRNGKey, state: Array, action: Array):
         position, velocity = state
-        action = jnp.clip(jnp.squeeze(action), -1.0, 1.0)
-
+        # action = jnp.clip(jnp.squeeze(action), -1.0, 1.0)
+        action = jnp.squeeze(action)
+        
         velocity = self.velocity_decay * velocity
         velocity += self.action_scale * action
         velocity += self.process_std * jr.normal(key)

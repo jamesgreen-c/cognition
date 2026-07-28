@@ -47,11 +47,11 @@ args = parser.parse_args()
 
 
 # SETUP
-RPM_PRETRAINING_ITER = 2000
+RPM_PRETRAINING_ITER = 3000
 CFG, PRIOR, REC, MODEL, FREE_ENERGY = rpm_setup(args.D, args.rpm_batch_size, RPM_PRETRAINING_ITER, args.seed, args.stabilise)
 
 ENV = CentreSeekingEnvironment(T=args.T)
-AC_PRETRAINING_ITER = 250
+AC_PRETRAINING_ITER = 300
 AC_CFG, AC_LOSS = ac_setup(args.gamma, args.ac_batch_size, AC_PRETRAINING_ITER, args.ac_seed, MODEL, ENV, args.debug)
 
 
@@ -82,33 +82,28 @@ def main(key: PRNGKey):
     key, data_key, gen_key, mix_key = jr.split(key, 4)
 
     # initial dataset
-    anchor_data = get_data(
+    data = get_data(
         key=data_key,
         policy=random_policy,
         num_factors=1,
         num_sequences=args.N,
         num_timesteps=args.T,    
     )
-    data = anchor_data
-
-    # train the RPSSM on initial dataset
-    trainer = Trainer(free_energy=FREE_ENERGY, config=CFG)
-    trainer.fit(data.standardised_data.train_data, use_pbar=True)
-
-    # initial SLAC training
-    actorcritic = ActorCritic(loss=AC_LOSS, config=AC_CFG, environment=ENV)
-    actorcritic.fit(data.train_data, trainer.params)  # explicitly non-standardised data
-
-    # generate next data
-    new_data = actorcritic.generate(key=gen_key, N=args.N)
-
-    # integrate new data
-    data = mix_data(mix_key, anchor_data, data, new_data)
 
     # run training loop
     for iter in range(args.num_iter):
         key, subkey = jr.split(key)
-        trainer, actorcritic, data = outer_step(subkey, trainer, actorcritic, data, anchor_data)
+
+        # train the RPSSM on initial dataset
+        trainer = Trainer(free_energy=FREE_ENERGY, config=CFG)
+        trainer.fit(data.standardised_data.train_data, use_pbar=True)
+    
+        # initial SLAC training
+        actorcritic = ActorCritic(loss=AC_LOSS, config=AC_CFG, environment=ENV)
+        actorcritic.fit(data.train_data, trainer.params)  # explicitly non-standardised data
+    
+        # generate next data
+        data = actorcritic.generate(key=gen_key, N=args.N)
 
     
     # save data, params, and loss

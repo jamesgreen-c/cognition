@@ -44,13 +44,14 @@ def rpm_setup(
     return CFG, PRIOR, REC, MODEL, FREE_ENERGY
 
 
-def ac_setup(gamma: float, batch_size: int, num_iter: int, seed: int, model: rpm.RPSSM, environment: Environment):
+def ac_setup(gamma: float, batch_size: int, num_iter: int, seed: int, model: rpm.RPSSM, environment: Environment, debug: bool):
 
     AC_CFG = ActorCriticConfig(
         gamma=gamma,
         num_iter=num_iter,
         batch_size=batch_size,
-        seed=seed
+        seed=seed,
+        debug=debug
     )
 
     # actor
