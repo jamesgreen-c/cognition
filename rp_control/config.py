@@ -9,9 +9,10 @@ LearningRate = Union[float, Callable[[int], float]]
 
 @dataclass
 class OptimConfig:
-    """ Configuration for a single parameter block optimiser. """
-    optimizer: Callable[[float], optax.GradientTransformation] = optax.adam
+    """Configuration for a single parameter block optimiser."""
+    optimizer: Callable[[LearningRate], optax.GradientTransformation] = optax.adam
     lr: LearningRate = 1e-3
+    max_grad_norm: Optional[float] = None
 
     decay_steps: Optional[int] = None
     decay_rate: Optional[float] = None
@@ -35,8 +36,16 @@ class OptimConfig:
         )
 
     def build(self) -> optax.GradientTransformation:
-        """ Builds the Optax optimiser. """
-        return self.optimizer(self.schedule())
+        """Builds the Optax optimiser, optionally with global gradient clipping."""
+        optimizer = self.optimizer(self.schedule())
+
+        if self.max_grad_norm is None:
+            return optimizer
+
+        return optax.chain(
+            optax.clip_by_global_norm(self.max_grad_norm),
+            optimizer,
+        )
 
 
 @dataclass
@@ -54,5 +63,14 @@ class Config:
     seed: int = 0
     debug: bool = False
 
-    actor: OptimConfig = field(default_factory=lambda: OptimConfig(optimizer=optax.adam, lr=1e-3))
-    critic: OptimConfig = field(default_factory=lambda: OptimConfig(optimizer=optax.adam, lr=1e-3))
+    actor: OptimConfig = field(default_factory=lambda: OptimConfig(
+        optimizer=optax.adam, 
+        lr=5e-4, 
+        max_grad_norm=10.0
+    ))
+
+    critic: OptimConfig = field(default_factory=lambda: OptimConfig(
+        optimizer=optax.adam, 
+        lr=1e-3, 
+        max_grad_norm=10.0
+    ))
