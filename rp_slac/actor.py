@@ -79,13 +79,22 @@ class Actor:
         nat_params = self.network.apply(params, state)
         dist = nat_params.dist_param
 
-        raw_action = dist.sample(key=key)
+        raw_action = dist.sample(key=key, shape=())
 
         action = jnp.tanh(raw_action)
         log_prob = dist.log_prob(raw_action)
         log_prob -= jnp.sum(jnp.log(1.0 - action ** 2 + 1e-6))
 
         return action, log_prob
+
+    def stats(self, params, state):
+        nat_params = self.network.apply(params, state)
+        dist = nat_params.dist_param
+
+        mean = dist.params["mean"]
+        std = jnp.sqrt(jnp.diag(dist.params["cov"]))
+
+        return jnp.tanh(mean), std
 
 
 
