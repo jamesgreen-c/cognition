@@ -5,45 +5,28 @@ import matplotlib.pyplot as plt
 
 import numpy as np
 
-from rp_ssm import training
-from rp_ssm.recognition import networks
-from rp_ssm.utils.nnreg import DecoderNetwork, DecoderTrainer, Config as DecConfig
-
-from experiments.seeker.config import rpm_setup
-
 
 # ARGS PARSING
 parser = argparse.ArgumentParser()
-parser.add_argument("--D", dest="D", type=int, default=5)
-
-parser.add_argument("--N", dest="N", type=int, default=250)
-parser.add_argument("--T", dest="T", type=int, default=100)
+parser.add_argument("--N", dest="N", type=int, default=1)
+parser.add_argument("--D", dest="D", type=int, default=10)
+parser.add_argument("--T", dest="T", type=int, default=50)
 
 parser.add_argument("--stabilise", dest="stabilise", default="clip")
-
-parser.add_argument("--num-iter", dest="num_iter", type=int, default=10)
-
-parser.add_argument("--rec-steps", dest="rec_steps", type=int, default=500)
-parser.add_argument("--rpm-batch-size", dest="rpm_batch_size", type=int, default=32)
-
 parser.add_argument("--gamma", dest="gamma", type=float, default=0.99)
-parser.add_argument("--control-steps", dest="control_steps", type=int, default=100)
-parser.add_argument("--ac-batch-size", dest="ac_batch_size", type=int, default=32)
+
+parser.add_argument("--pretrain-iter", dest="pretrain_iter", type=int, default=3000)
+parser.add_argument("--num-iter", dest="num_iter", type=int, default=2300)
+parser.add_argument("--batch-size", dest="batch_size", type=int, default=32)
 
 parser.add_argument("--seed", dest="seed", type=int, default=1234)
-parser.add_argument("--ac-seed", dest="ac_seed", type=int, default=9876)
 
-parser.add_argument("--regression", action="store_true")
-parser.add_argument("--no-regression", dest="regression", action="store_false")
-parser.set_defaults(regression=False)
+parser.add_argument("--debug", dest="debug", action="store_true")
+parser.add_argument("--no-debug", dest="debug", action="store_false")
+parser.set_defaults(debug=False)
 
-parser.add_argument("--B", dest="B", type=int, default=10)
 args = parser.parse_args()
 
-
-RPM_PRETRAINING_ITER = 5000
-CFG, _, _, _, FREE_ENERGY = rpm_setup(args.D, args.rpm_batch_size, RPM_PRETRAINING_ITER, args.seed, args.stabilise)
-FREE_ENERGY.num_timesteps = args.T
 
 # LOAD SAVED DATA, PARAMS and LOSS
 EXPERIMENT_NAME = f"D={args.D},N={args.N},T={args.T},iter={args.num_iter},stabilise={args.stabilise},seed={args.seed}"
@@ -58,145 +41,184 @@ with open(f"{DIRPATH}/params.pkl", "rb") as f:
 with open(f"{DIRPATH}/loss.pkl", "rb") as f:
     LOSS = pickle.load(f)
 
-with open(f"{DIRPATH}/data.pkl", "rb") as f:
-    DATA = pickle.load(f)
-    DATA = DATA.standardised_data
+with open(f"{DIRPATH}/buffer.pkl", "rb") as f:
+    BUFFER = pickle.load(f)
 
 with open(f"{DIRPATH}/rewards.pkl", "rb") as f:
     REWARDS = pickle.load(f)
 
+with open(f"{DIRPATH}/log_alphas.pkl", "rb") as f:
+    LOG_ALPHA_HIST = pickle.load(f)
 
-# RECONSTRUCT TRAINER
-TRAINER = training.Trainer(free_energy=FREE_ENERGY, config=CFG)
-TRAINER.params = PARAMS
+with open(f"{DIRPATH}/actor_stats.pkl", "rb") as f:
+    ACTOR_STATS = pickle.load(f)
+
+with open(f"{DIRPATH}/action_grid.pkl", "rb") as f:
+    ACTION_GRID = pickle.load(f)
 
 PLOTDIR = f"{DIRPATH}/plots"
 if not os.path.exists(PLOTDIR):
     os.mkdir(PLOTDIR)
 
-def train_decoder():
-    """ train the decoder on RPM posterior means to ground truths """
-    true_dim = DATA.train_states[0].shape[-1]
 
-    # apply model to get posterior train state means
-    _, posterior = TRAINER.apply((DATA.train_data[0], ))
-    means = posterior.params["means"]
+def plot_loss():
+    model_losses = LOSS["model"]
+    critic_losses = LOSS["critic"]
+    actor_losses = LOSS["actor"]
+    alpha_losses = LOSS["alpha"]
 
-    # define and fit decoder
-    net = DecoderNetwork(network=networks.MLP([10, 10, 10]), output_dim=true_dim)
-    decfg = DecConfig(batch_size=64, iterations=3000, seed=args.seed+2)
-    decoder = DecoderTrainer(model=net, config=decfg)
-    decoder.fit(x=DATA.train_states, y=means)
+    def _plot(_loss, _name):
+        plt.figure(figsize=(15, 5))
+        plt.plot(_loss)
+        plt.xlabel("Iteration")
+        plt.ylabel("Loss")
+        plt.title(f"{_name} loss over training iterations")
+        plt.tight_layout()
+        plt.savefig(f"{PLOTDIR}/{_name}_loss.png")
+        plt.close()
 
-    # # check fit
-    preds = decoder.apply(params=decoder.params, y=means)
-    return decoder, preds
+    _plot(model_losses, "model")
+    _plot(critic_losses, "critic")
+    _plot(actor_losses, "actor")
+    _plot(alpha_losses, "alpha")
 
 
-def apply_decoder(decoder: DecoderTrainer):
-    """ apply learned decoder to RPM posterior means on validation data """
-    _slice = slice(args.B)  # number of val sequences to test against
+def plot_buffer():
+    obs, actions, rewards, flags, log_probs = BUFFER
 
-    # apply model to get posterior validation state means
-    _, posterior = TRAINER.apply((DATA.val_data[0][_slice], ))
-    means = posterior.params["means"]
+    def _plot(_series, _name):
+        plt.figure(figsize=(15, 5))
+        plt.plot(_series)
+        plt.xlabel("Iteration")
+        plt.ylabel(f"{_name}")
+        plt.title(f"{_name} over training iterations")
+        plt.tight_layout()
+        plt.savefig(f"{PLOTDIR}/{_name}.png")
+        plt.close()
 
-    # apply trained decoder
-    return decoder.apply(params=decoder.params, y=means)
-    
+    _plot(actions[0], "actions")
+    _plot(rewards[0], "rewards")
 
-def analyse_regression():
-    """
-    Plot:
-    1. The loss of the decoder training over time
-    2. The regression for the RPM train state means to the true train latents
-    3. The regression for the RPM validation state means to the true validation latents
-    """
-    decoder, training_preds = train_decoder()
-    validation_preds = apply_decoder(decoder)  # (B, T, true_dim)
+    fig, ax = plt.subplots(2, 1, figsize=(15, 10))
 
-    true_dim = DATA.train_states[0].shape[-1]
+    # pos
+    ax[0].plot(obs[0, :, 0], label="position")
+    ax[0].set_title("Position over training iterations")
+    ax[0].set_xlabel("Iteration")
+    ax[0].set_ylabel("Position")
 
-    # plot training examples (same number of validation examples)
-    fig, ax = plt.subplots(args.B, true_dim, figsize=(15, 5*args.B))
-    for b in range(args.B):
-        for d in range(true_dim):
-            ax[b, d].plot(training_preds[b, :, d])
-            ax[b, d].plot(DATA.train_states[b, :, d], color="black", linestyle="--")
+    # vels
+    ax[1].plot(obs[0, :, 1], label="velocity")
+    ax[1].set_title("Velocity over training iterations")
+    ax[1].set_xlabel("Iteration")
+    ax[1].set_ylabel("Velocity")
+
     plt.tight_layout()
-    fig.savefig(f"{PLOTDIR}/train_regression.png")
-
-    # plot validations examples
-    fig, ax = plt.subplots(args.B, true_dim, figsize=(15, 5*args.B))
-    for b in range(args.B):
-        for d in range(true_dim):
-            ax[b, d].plot(validation_preds[b, :, d])
-            ax[b, d].plot(DATA.val_states[b, :, d], color="black", linestyle="--")
-    plt.tight_layout()
-    fig.savefig(f"{PLOTDIR}/validation_regression.png")
-
-    # plot decoder loss
-    plt.figure(figsize=(15, 5))
-    plt.plot(decoder.loss_tot)
-    plt.xlabel("Iteration")
-    plt.ylabel("Loss")
-    plt.title("Loss over training iterations")
-    plt.tight_layout()
-    plt.savefig(f"{PLOTDIR}/decoder_loss.png")
+    plt.savefig(f"{PLOTDIR}/observations.png")
     plt.close()
-
-
-def analyse_training():
+    
+    
+def plot_rpm_params():
     """
     Plot:
     1. Loss over time
     2. Learned A matrix
     """
 
-    # plot loss
-    plt.figure(figsize=(15, 5))
-    plt.plot(LOSS)
-    plt.xlabel("Iteration")
-    plt.ylabel("Loss")
-    plt.title("Loss over training iterations")
+    def _plot(mat, _name):
+        plt.figure()
+        plt.imshow(mat)
+        plt.title(f"Learned {_name} on representation")
+        plt.colorbar()
+        plt.tight_layout()
+        plt.savefig(f"{PLOTDIR}/{_name}.png")
+
+    A = PARAMS["prior"]["A"]  # (D, D)
+    B = PARAMS["prior"]["B"]  # (D, K)
+
+    _plot(A, "A")
+    _plot(B, "B")
+
+
+def plot_actor_stats():
+
+    means = ACTOR_STATS["mean"]
+    stds = ACTOR_STATS["std"]
+
+    def _plot(_series, _name):
+        plt.figure(figsize=(15, 5))
+        plt.plot(_series)
+        plt.xlabel("Iteration")
+        plt.ylabel(f"{_name}")
+        plt.title(f"{_name} over training iterations")
+        plt.tight_layout()
+        plt.savefig(f"{PLOTDIR}/{_name}.png")
+        plt.close()
+
+    _plot(means.mean(axis=1), "actor_mean")   # (T, B, 1) -> (T, 1)
+    _plot(stds.mean(axis=1), "actor_std")
+
+
+def plot_action_grid():
+    positions = ACTION_GRID["positions"]
+    velocities = ACTION_GRID["velocities"]
+    actions = ACTION_GRID["actions"]
+
+    plt.figure(figsize=(10, 7))
+
+    contour = plt.contourf(
+        positions,
+        velocities,
+        actions,
+        levels=50,
+        cmap="coolwarm",
+        vmin=-1.0,
+        vmax=1.0,
+    )
+
+    plt.colorbar(contour, label="Action")
+    plt.contour(
+        positions,
+        velocities,
+        actions,
+        levels=[0.0],
+        colors="black",
+        linewidths=1.5,
+    )
+
+    plt.xlabel("Position")
+    plt.ylabel("Velocity")
+    plt.title("Actor action surface")
     plt.tight_layout()
-    plt.savefig(f"{PLOTDIR}/loss.png")
+    plt.savefig(f"{PLOTDIR}/action_surface.png")
     plt.close()
 
-    A = PARAMS[0]["A"]  # (D, D)
-    plt.figure()
-    plt.imshow(A)
-    plt.title("Learned A on representation")
-    plt.tight_layout()
-    plt.savefig(f"{PLOTDIR}/A.png")
 
+def plot_training_stats():
 
-def analyse_rewards():
-    # plot rewards
-    plt.figure(figsize=(15, 5))
-    plt.plot(REWARDS)
-    plt.xlabel("Iteration")
-    plt.ylabel("Rewards")
-    plt.title("Mean rewards over training iterations")
-    plt.tight_layout()
-    plt.savefig(f"{PLOTDIR}/rewards.png")
-    plt.close()
+    average_rewards = REWARDS
+    log_alpha_hist = LOG_ALPHA_HIST 
 
-    # plt.figure(figsize=(15, 5))
-    # plt.plot(np.log(REWARDS))
-    # plt.xlabel("Iteration")
-    # plt.ylabel("Log Rewards")
-    # plt.title("Log mean rewards over training iterations")
-    # plt.tight_layout()
-    # plt.savefig(f"{PLOTDIR}/log_rewards.png")
-    # plt.close()
+    def _plot(_series, _name):
+        plt.figure(figsize=(15, 5))
+        plt.plot(_series)
+        plt.xlabel("Iteration")
+        plt.ylabel(f"{_name}")
+        plt.title(f"{_name} over training iterations")
+        plt.tight_layout()
+        plt.savefig(f"{PLOTDIR}/{_name}.png")
+        plt.close()
 
+    _plot(average_rewards, "average_reward")
+    _plot(log_alpha_hist, "log_alphas")
 
 if __name__ == "__main__":
 
-    analyse_training()
-    analyse_rewards()
-    
-    if args.regression:
-        analyse_regression()
-    
+    print(f"Log alpha: {PARAMS['log_alpha']}")
+
+    plot_training_stats()
+    plot_buffer()
+    plot_loss()
+    plot_rpm_params()
+    plot_actor_stats()
+    plot_action_grid()

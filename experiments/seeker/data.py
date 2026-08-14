@@ -1,26 +1,11 @@
-import jax
 import jax.numpy as jnp
 import jax.random as jr
 
-from typing import Callable
-
-from jax import Array, lax, vmap
+from jax import Array
 from jax.random import PRNGKey
+from jax.scipy.stats import uniform
 
-from rp_ssm.utils.dataset import Dataset
-from rp_control.environment import Environment
-
-
-# ===== helper function =====
-
-def angle_normalise(theta):
-    return (theta + jnp.pi) % (2.0 * jnp.pi) - jnp.pi
-
-def random_policy(key, state):
-    """
-    take random actions initially. Must be atleast 1D
-    """
-    return jr.uniform(key, (1,), minval=-1.0, maxval=1.0)
+from rp_slac.environment import Environment
 
 
 # ===== data generation =====
@@ -49,14 +34,14 @@ class CentreSeekingEnvironment(Environment):
 
     def observe(self, key: PRNGKey, state: Array):
         position, velocity = state
-        return jnp.array([
-            position,
-            velocity,
-            position**2,
-            jnp.sin(position),
-            jnp.cos(position),
-        ])
-        # return state /
+        # return jnp.array([
+        #     position,
+        #     velocity,
+        #     position**2,
+        #     jnp.sin(position),
+        #     jnp.cos(position),
+        # ])
+        return state
 
     def transition(self, key: PRNGKey, state: Array, action: Array):
         position, velocity = state
@@ -76,47 +61,41 @@ class CentreSeekingEnvironment(Environment):
         action = jnp.squeeze(action)
 
         reward = -position**2
-        reward -= 0.05 * velocity**2
-        reward -= 0.001 * action**2
+        reward -= 0.1 * velocity**2
+        reward -= 0.05 * action**2
         return next_state, reward
+
+    def random_action(self, key: PRNGKey, state):
+        """
+        take random actions initially. Must be atleast 1D
+        """
+        action = jr.uniform(key, (1,), minval=-1.0, maxval=1.0)
+        log_prob = uniform.logpdf(action, loc=-1, scale=2).sum()
+        return action, log_prob
+
+    def is_terminal_state(self, state):
+        """Reset the environment when position leaves [-5, 5]."""
+        position, _ = state
+        return jnp.abs(position) >= 5.0
+
+    def grid(self, num_positions: int = 101, num_velocities: int = 101):
+        """Make an observation grid over positions and velocities."""
+        positions = jnp.linspace(-5.0, 5.0, num_positions)
+        velocities = jnp.linspace(-1.0, 1.0, num_velocities)
+
+        position_grid, velocity_grid = jnp.meshgrid(positions, velocities, indexing="ij")
+
+        # observation_grid = jnp.stack(
+        #     [
+        #         position_grid,
+        #         velocity_grid,
+        #         position_grid**2,
+        #         jnp.sin(position_grid),
+        #         jnp.cos(position_grid),
+        #     ],
+        #     axis=-1,
+        # )
+        observation_grid = jnp.stack([position_grid, velocity_grid], axis=-1)
+
+        return observation_grid
     
-
-def get_data(
-        key: PRNGKey,
-        policy: Callable,
-        num_factors: int,
-        num_sequences: int,
-        num_timesteps: int,
-        emission_cov: float = 0.1,
-    ) -> Dataset:
-
-    print(f"""
-Generating pendulum data:
-    - Num factors:      {num_factors}
-    - Sequences:        {num_sequences}
-    - Timesteps:        {num_timesteps}
-""")
-
-    J, N, T = num_factors, num_sequences, num_timesteps
-    M = N + N // 4      # 25% extra for validation data
-
-    # initialise
-    environment = CentreSeekingEnvironment(T=T)
-
-    # sample latent states using policy
-    _, latent_sample, obs_samples, actions = environment.sample(
-        key,
-        policy,
-        num_samples=M,
-    )
-    
-    return Dataset(
-        train_data=(obs_samples[:N], ),
-        train_states=latent_sample[:N],
-        val_data=(obs_samples[N:], ),
-        val_states=latent_sample[N:],
-        params={
-            "train_actions": actions[:N],
-            "val_actions": actions[N:],
-        },
-    )
