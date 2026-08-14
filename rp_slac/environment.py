@@ -84,8 +84,8 @@ class Environment(ABC):
             state, obs = carry
 
             # action-conditioned transition
-            action, _ = policy(policy_key, obs)
-            reward, next_state = self.model(model_key, state, action)
+            action, log_prob = policy(policy_key, obs)
+            next_state, reward = self.model(model_key, state, action)
 
             # if terminal reset environment
             terminal = self.is_terminal_state(next_state)
@@ -95,17 +95,17 @@ class Environment(ABC):
             # choose next state and observe
             next_state = jnp.where(terminal, reset_state, next_state)
             next_obs = self.observe(observation_key, next_state)
-            return (next_state, next_obs), (next_state, next_obs, action, reward, flag)
+            return (next_state, next_obs), (next_state, next_obs, action, reward, flag, log_prob)
 
         obs_0 = self.observe(obs_key, state_0)
         carry_0 = (state_0, obs_0)
         (final_state, _), outputs = lax.scan(scan_step, carry_0, step_keys)
-        states, observations, actions, rewards, flags = outputs
+        states, observations, actions, rewards, flags, log_probs = outputs
 
         # insert state 0
         states = jnp.concatenate([state_0[None], states], axis=0)
         observations = jnp.concatenate([obs_0[None], observations], axis=0)
-        return final_state, states, observations, actions, rewards, flags
+        return final_state, states, observations, actions, rewards, flags, log_probs
 
     def is_terminal_state(self, state: Array) -> Array:
         """
