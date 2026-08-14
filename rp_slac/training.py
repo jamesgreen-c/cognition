@@ -60,13 +60,12 @@ class RPSLAC:
         if self.config.actor_state == "observation":
                 
             M = env_states.shape[0]
-            env_states, _, observations, actions, rewards, flags = self.env.sample(
+            env_states, _, observations, actions, rewards, flags, log_probs = self.env.sample(
                 key=key, 
                 policy=policy, 
                 num_samples=M, 
                 num_steps=K, 
                 state_0=env_states,
-                actor_state=self.config.actor_state
             )
 
         else:
@@ -78,7 +77,8 @@ class RPSLAC:
         actions = jnp.concatenate((data[1][:, K:], actions), axis=1)
         rewards = jnp.concatenate((data[2][:, K:], rewards), axis=1)
         flags = jnp.concatenate((data[3][:, K:], flags), axis=1)
-        replay_buffer = (observations, actions, rewards, flags)
+        log_probs = jnp.concatenate((data[4][:, K:], log_probs), axis=1)
+        replay_buffer = (observations, actions, rewards, flags, log_probs)
 
         return replay_buffer, env_states
     
@@ -98,14 +98,16 @@ class RPSLAC:
 
         # run model updates and sample latents
         params, opt_states, model_loss, posterior = self._update_model(itr, params, opt_states, data)
+        # latents = posterior.params["means"]
         latents = posterior.sample(sample_key)
 
         # run soft actor-critic updates
         params, opt_states, critic_loss = self._update_critic(critic_key, params, opt_states, latents, data)
-        params, opt_states, actor_loss = self._update_actor(actor_key, params, opt_states, latents, data)
+        params, opt_states, actor_loss, aux = self._update_actor(actor_key, params, opt_states, latents, data)
+        params, opt_states, alpha_loss = self._update_alpha(params, opt_states, data)
 
-        losses = {"model": model_loss, "critic": critic_loss, "actor": actor_loss}
-        return params, opt_states, losses
+        losses = {"model": model_loss, "critic": critic_loss, "actor": actor_loss, "alpha": alpha_loss}
+        return params, opt_states, losses, aux
     
 
     def fit(self, use_pbar: bool = True) -> None:
@@ -142,8 +144,12 @@ class RPSLAC:
         self.model_losses = []
         self.critic_losses = []
         self.actor_losses = []
+        self.alpha_losses = []
+
         self.average_rewards = []
-        
+        self.actor_stats = []
+        self.alpha_hist = []
+
         pbar = tqdm(range(self.config.num_iter), disable=not(use_pbar), desc="Training")
         for self.itr in pbar:
             key, collection_key, batch_key, train_key = jr.split(key, 4)
@@ -151,7 +157,7 @@ class RPSLAC:
             replay_buffer, env_states = experience_step(collection_key, self.params, env_states, replay_buffer)
             batch = self._get_batch(batch_key, replay_buffer)
             
-            self.params, self.opt_states, losses = train_step(train_key, self.itr, self.params, self.opt_states, batch)
+            self.params, self.opt_states, losses, aux = train_step(train_key, self.itr, self.params, self.opt_states, batch)
             self._stabilise_params()
 
             # calculate average reward
@@ -160,13 +166,18 @@ class RPSLAC:
             self.model_losses.append(losses["model"])
             self.critic_losses.append(losses["critic"])
             self.actor_losses.append(losses["actor"])
-            self.average_rewards.append(self.average_rewards)
+            self.alpha_losses.append(losses["alpha"])
+
+            self.average_rewards.append(average_reward)
+            self.actor_stats.append(aux)
+            self.alpha_hist.append(float(self.params["log_alpha"]))
 
             pbar.set_postfix(
-                average_reward=average_reward, 
-                model_loss=losses["model"], 
-                critic_loss=losses["critic"], 
-                actor_loss=losses["actor"]
+                average_reward="{:.4f}".format(float(average_reward)),
+                model_loss="{:.3f}".format(float(losses["model"])),
+                critic_loss="{:.3f}".format(float(losses["critic"])),
+                actor_loss="{:.3f}".format(float(losses["actor"])),
+                alpha_loss="{:.3f}".format(float(losses["alpha"]))
             )
 
         return self.params, replay_buffer
@@ -195,21 +206,23 @@ class RPSLAC:
         opts = {**control_opts, **model_opts}
 
         return params, opt_states, opts
-
+    
 
     def _init_replay_buffer(self, key: PRNGKey):
         """ Initialise the replay buffer to capacity """
-        env_states, _, observations, actions, rewards, flags = self.env.sample(
+        env_states, _, observations, actions, rewards, flags, log_probs = self.env.sample(
             key=key,
             policy=self.env.random_action,
             num_samples=self.config.num_buffers,
             num_steps=self.config.capacity,
         )
-        return (observations, actions, rewards, flags), env_states
+        return (observations, actions, rewards, flags, log_probs), env_states
+    
 
     def _get_batch(self, key: PRNGKey, replay_buffer: tuple[Array]):
         """
-        Sample B contiguous windows independently from each of N buffers.
+        Sample B contiguous windows independently from each of N buffers,
+        without crossing episode boundaries.
 
         Returns
         -------
@@ -218,7 +231,7 @@ class RPSLAC:
         rewards:      (N * B, tau)
         discounts:    (N * B, tau)
         """
-        observations, actions, rewards, discounts = replay_buffer
+        observations, actions, rewards, discounts, log_probs = replay_buffer
 
         N = self.config.num_buffers
         B = self.config.batch_size
@@ -226,7 +239,7 @@ class RPSLAC:
         capacity = actions.shape[1]
 
         if observations.shape[:2] != (N, capacity + 1):
-            raise ValueError("Expected observations shaped (N, C + 1, ...), received {}.".format(observations.shape))
+            raise ValueError(f"Expected observations shaped (N, C + 1, ...), received {observations.shape}.")
 
         num_starts = capacity - tau + 1
         if num_starts <= 0:
@@ -234,8 +247,18 @@ class RPSLAC:
 
         keys = jr.split(key, N)
 
-        def sample_buffer(key, obs, act, rew, disc):
-            starts = jr.randint(key, (B,), 0, num_starts)
+        def sample_buffer(key, obs, act, rew, disc, log_ps):
+            # number of terminal transitions in every length-tau window
+            terminals = 1.0 - disc
+            cumulative = jnp.concatenate([jnp.zeros((1,), dtype=terminals.dtype), jnp.cumsum(terminals)])
+            terminal_counts = cumulative[tau:] - cumulative[:-tau]
+
+            # valid only when the complete window belongs to one episode
+            valid_starts = terminal_counts == 0
+
+            # uniform sampling with replacement over valid starts
+            logits = jnp.where(valid_starts, 0.0, -jnp.inf)
+            starts = jr.categorical(key, logits, shape=(B,))
 
             def sample_window(start):
                 return (
@@ -243,11 +266,12 @@ class RPSLAC:
                     jax.lax.dynamic_slice_in_dim(act, start, tau, axis=0),
                     jax.lax.dynamic_slice_in_dim(rew, start, tau, axis=0),
                     jax.lax.dynamic_slice_in_dim(disc, start, tau, axis=0),
+                    jax.lax.dynamic_slice_in_dim(log_ps, start, tau, axis=0)
                 )
 
             return vmap(sample_window)(starts)
 
-        batch = vmap(sample_buffer)(keys, observations, actions, rewards, discounts)
+        batch = vmap(sample_buffer)(keys, observations, actions, rewards, discounts, log_probs)
         return tuple(x.reshape((N * B,) + x.shape[2:]) for x in batch)
 
 
@@ -282,13 +306,13 @@ class RPSLAC:
     def _update_critic(self, key, params, opt_states, latents, data):
         """ Update soft critic parameters """
         rho = self.config.target_update_rate
-        _params = {"actor": params["actor"], "critic": params["critic"]}
+        _params = {"actor": params["actor"], "critic": params["critic"], "log_alpha": params["log_alpha"]}
 
         # latest param updates
         loss, grads = jax.value_and_grad(self.control.critic_loss, argnums=1)(key, _params, latents, data)
-        latest_updates, latest_opt_states = self.opts["critic"].update(grads["critic"]["latest"], 
-                                                                       opt_states["critic"]["latest"], 
-                                                                       params["critic"]["latest"])
+        latest_updates, new_critic_opt_states = self.opts["critic"].update(grads["critic"]["latest"], 
+                                                                           opt_states["critic"], 
+                                                                           params["critic"]["latest"])
         latest_params = optax.apply_updates(params["critic"]["latest"], latest_updates)
 
         # target param updates
@@ -297,22 +321,39 @@ class RPSLAC:
 
         # return updated params and opt_states
         critic_params = {"latest": latest_params, "target": target_params}
-        critic_opt_states = {"latest": latest_opt_states, "target": opt_states["critic"]["target"]}
         new_params = {**params, "critic": critic_params}
-        new_opt_states = {**opt_states, "critic": critic_opt_states}
+        new_opt_states = {**opt_states, "critic": new_critic_opt_states}
         return new_params, new_opt_states, loss
 
 
     def _update_actor(self, key, params, opt_states, latents, data):
         """ Update soft actor parameters """
 
-        _params = {"actor": params["actor"], "critic": params["critic"]}
-        loss, grads = jax.value_and_grad(self.control.actor_loss, argnums=1)(key, _params, latents, data)
+        _params = {"actor": params["actor"], "critic": params["critic"], "log_alpha": params["log_alpha"]}
+        (loss, aux), grads = jax.value_and_grad(
+            self.control.actor_loss, argnums=1, has_aux=True
+        )(key, _params, latents, data)
+
         updates, new_actor_opt_states = self.opts["actor"].update(grads["actor"], opt_states["actor"], params["actor"])
         actor_params = optax.apply_updates(params["actor"], updates)
 
         new_params = {**params, "actor": actor_params}
         new_opt_states = {**opt_states, "actor": new_actor_opt_states}
+        return new_params, new_opt_states, loss, aux
+
+
+    def _update_alpha(self, params, opt_states, data: tuple[Array]):
+        """ Update log temperature parameter """
+        _params = {"log_alpha": params["log_alpha"]}
+        loss, grads = jax.value_and_grad(self.control.alpha_loss)(_params, data)
+
+        updates, alpha_opt_state = self.opts["alpha"].update(grads["log_alpha"], 
+                                                             opt_states["alpha"], 
+                                                             params["log_alpha"])
+
+        log_alpha = optax.apply_updates(params["log_alpha"], updates)
+        new_params = {**params,"log_alpha": log_alpha}
+        new_opt_states = {**opt_states, "alpha": alpha_opt_state}
         return new_params, new_opt_states, loss
 
 
@@ -324,9 +365,24 @@ class RPSLAC:
             self.params["prior"]["A"] = clip_sv(self.params["prior"]["A"], EPS)
 
 
-    def apply(self, data: tuple[Array]) -> None:
-        pass
+    def apply(self, key: PRNGKey, params: dict, observations: Array, deterministic: bool = True) -> Array:
+        """ 
+        Get the action for the given observation and parameters
+        
+        Parameters
+        ----------
+        key:           RNG
+        params:        Trained model and control parameters
+        obseravtions:  (B, D) or (D,) for a set of B (or one) observations 
+        """
+        if observations.ndim == 1:
+            observations = observations[None]
 
+        if deterministic:
+            return vmap(lambda state: self.control.mean_policy(params, state))(observations)
+
+        keys = jr.split(key, observations.shape[0])
+        return vmap(lambda _key, state: self.control.policy(_key, params, state))(keys, observations)
 
 
  # def train_continue(self, data: tuple[Array], new_iter: int, key: Array, y: Array = None):

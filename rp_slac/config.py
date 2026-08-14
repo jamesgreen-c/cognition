@@ -59,10 +59,12 @@ class Config:
 
     # control
     gamma: float = 0.99
-    temperature: float = 0.95
-    target_update_rate: float = 0.005
+    target_update_rate: float = 0.01
     actor_state: str = "observation"
     stop_actor_gradient: bool = True
+
+    initial_log_alpha: float = 0.0
+    target_entropy: float | None = None
 
     # model
     beta_schedule: LearningRate = lambda i: 1.0
@@ -87,7 +89,7 @@ class Config:
 
     actor: OptimConfig = field(default_factory=lambda: OptimConfig(
         optimizer=optax.adam,
-        lr=5e-4,
+        lr=1e-3,
         max_grad_norm=10.0,
     ))
 
@@ -95,4 +97,10 @@ class Config:
         optimizer=optax.adam,
         lr=1e-3,
         max_grad_norm=10.0,
+    ))
+
+    alpha: OptimConfig = field(default_factory=lambda: OptimConfig(
+        optimizer=optax.adam,
+        lr=3e-4,
+        max_grad_norm=None,
     ))
