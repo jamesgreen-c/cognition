@@ -28,7 +28,7 @@ class ConstrainedIVFreeEnergy:
         ) -> tuple[dict, dict[optax.OptState], dict[optax.GradientTransformation]]:
         observations, *_ = data
 
-        self.num_timesteps = observations.shape[1]
+        self.num_timesteps = config.sequence_length + 1
         self.batch_size = config.batch_size
         self.num_buffers = config.num_buffers
         self.num_factors = 1
@@ -64,14 +64,14 @@ class ConstrainedIVFreeEnergy:
         return loss, aux
     
     def get_posterior(self, prior, rec_params, actions, observations):
-        factors_nat = self.model.get_factors(rec_params, (observations,))                           # JxBxTxK
-        factors_tot = AllParam(factors_nat.sum(axis=0))                                             # BxTxK
+        factors_nat = self.model.get_factors(rec_params, (observations,))                  # JxBxTxK
+        factors_tot = AllParam(factors_nat.sum(axis=0))                                    # BxTxK
 
-        prior_chains = vmap(lambda _acts: prior.to_chain(self.num_timesteps, _acts))(actions)       # TxK
+        prior_chains = vmap(lambda _acts: prior.to_chain(_acts))(actions)                  # TxK
         posterior = vmap(
             lambda f, _acts: parallel_smoother(prior, f, _acts, self.model.latent_dim)
-        )(factors_tot.dist_param, actions)                                                          # BxTxK
-        
+        )(factors_tot.dist_param, actions)                                                 # BxTxK
+
         return prior_chains, factors_nat, posterior
         #TODO: implement flexible_vmap function for factors
 
@@ -115,7 +115,8 @@ def parallel_smoother(prior, factors, actions, latent_dim):
 
     # in rare cases the smoothed covariances have min. evalues ~-1e-6, so add a correction to be safe (checked that this has no effect on experiments that were already stable)
     smoother_out['smoothed_covariances'] += 1e-5 * jnp.eye(latent_dim)
-
+    smoother_out['filtered_covariances'] += 1e-5 * jnp.eye(latent_dim)
+    
     filtered_cov = smoother_out['filtered_covariances']
     smoothed_cov = smoother_out['smoothed_covariances']
     A, Q = prior.params['A'], prior.params['Q']

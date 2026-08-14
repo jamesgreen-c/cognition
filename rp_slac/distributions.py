@@ -6,6 +6,7 @@ from typing import Any, Union, Tuple, Optional
 
 from jax import vmap
 from jax.random import PRNGKey, multivariate_normal
+from jax.tree_util import tree_map
 from jax.scipy.linalg import solve_triangular
 from flax.core.frozen_dict import FrozenDict
 
@@ -328,7 +329,7 @@ class LGStationaryParam:
             new_params['A'] = nn.sigmoid(params['A'])
         return LGStationaryParam(stationary=self.stationary, **new_params)
     
-    def to_chain(self, num_timesteps, actions):
+    def to_chain(self, actions):
         """
         Construct p(z_1:T | a_1:T-1) as an LGChainDistParam.
 
@@ -347,6 +348,8 @@ class LGStationaryParam:
         if actions.ndim == 1:
             actions = actions[:, None]
 
+        num_timesteps = actions.shape[0] + 1
+
         m1 = self.params["m1"]
         Q1 = self.params["Q1"]
         A = self.params["A"]
@@ -359,7 +362,7 @@ class LGStationaryParam:
         Qs = jnp.concatenate([Q1[None], jnp.tile(Q[None], (num_timesteps-1, 1, 1))])
 
         # c_t = B a_t + b for p(z_{t+1} | z_t, a_t)
-        Cs = actions @ B.T + b    
+        Cs = actions @ B.T + b
         bs = jnp.concatenate([m1[None], Cs])
 
         @vmap
@@ -455,6 +458,55 @@ class LGChainDistParam(DistParam):
         """Strip of all cross-covariances"""
         return GaussianDistParam(mean=self.params["means"], cov=self.params["covs"])
 
+    # def sample(self, key: PRNGKey):
+    #     """ Sample series from means and covs """
+    #     return multivariate_normal(key, mean=self.params["means"], cov=self.params["covs"])
+
     def sample(self, key: PRNGKey):
-        """ Sample series from means and covs """
-        return multivariate_normal(key, mean=self.params["means"], cov=self.params["covs"])
+        """Sample a joint trajectory using backward conditional sampling."""
+        means = self.params["means"]
+        covs = self.params["covs"]
+        cross_covs = self.params["cross_covs"]
+
+        def sample_trajectory(key, means, covs, cross_covs):
+            T, latent_dim = means.shape
+            keys = jax.random.split(key, T)
+            I = jnp.eye(latent_dim)
+
+            # sample z_{T-1} from its smoothed marginal
+            z_T = multivariate_normal(keys[-1], mean=means[-1], cov=covs[-1])
+
+            def backward_step(z_next, inputs):
+                key, mean, next_mean, cov, next_cov, cross_cov = inputs
+
+                # cross_cov = Cov(z_{t+1}, z_t)
+                gain = jnp.linalg.solve(next_cov + 1e-6 * I, cross_cov).T
+
+                conditional_mean = mean + gain @ (z_next - next_mean)
+                conditional_cov = cov - gain @ cross_cov
+                conditional_cov = 0.5 * (conditional_cov + conditional_cov.T)
+                conditional_cov += 1e-6 * I
+
+                z = multivariate_normal(key, mean=conditional_mean, cov=conditional_cov)
+                return z, z
+
+            inputs = (
+                keys[:-1][::-1],
+                means[:-1][::-1],
+                means[1:][::-1],
+                covs[:-1][::-1],
+                covs[1:][::-1],
+                cross_covs[::-1],
+            )
+
+            _, reverse_samples = jax.lax.scan(backward_step, z_T, inputs)
+            return jnp.concatenate([reverse_samples[::-1], z_T[None]], axis=0)
+
+        # unbatched: (T, D)
+        if means.ndim == 2:
+            return sample_trajectory(key, means, covs, cross_covs)
+
+        # batched: (B, T, D)
+        B = means.shape[0]
+        keys = jax.random.split(key, B)
+        return vmap(sample_trajectory)(keys, means, covs, cross_covs)
