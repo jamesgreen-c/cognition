@@ -17,7 +17,7 @@ from experiments.seeker.setup import setup
 
 # ARGS PARSING
 parser = argparse.ArgumentParser()
-parser.add_argument("--N", dest="N", type=int, default=1)
+parser.add_argument("--N", dest="N", type=int, default=4)
 parser.add_argument("--D", dest="D", type=int, default=10)
 parser.add_argument("--T", dest="T", type=int, default=50)
 
@@ -26,7 +26,7 @@ parser.add_argument("--gamma", dest="gamma", type=float, default=0.99)
 
 parser.add_argument("--pretrain-iter", dest="pretrain_iter", type=int, default=3000)
 parser.add_argument("--num-iter", dest="num_iter", type=int, default=2300)
-parser.add_argument("--batch-size", dest="batch_size", type=int, default=32)
+parser.add_argument("--batch-size", dest="batch_size", type=int, default=8)
 
 parser.add_argument("--seed", dest="seed", type=int, default=1234)
 
@@ -66,8 +66,6 @@ def main():
         config=CONFIG
     )
     _, replay_buffer = trainer.fit(use_pbar=True)
-
-    # create results directory
 
     # save params
     with open(f"{DIRPATH}/params.pkl", "wb") as f: 

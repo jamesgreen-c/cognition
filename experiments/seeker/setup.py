@@ -53,9 +53,9 @@ def setup(
     # CONTROL DEFINITION
     actor_net = actor.ActorNetwork(
         network=networks.MLP([32, 32, 32]),
-        dist_map=distmaps.MVNDiag(K)
+        dist_map=distmaps.SLACMVNDiag(K)
     )
-    ACTOR = actor.Actor(network=actor_net)
+    ACTOR = actor.Actor(network=actor_net, action_low=-1.0, action_high=1.0)
 
     critic_net = critic.CriticNetwork(network=networks.MLP([32, 32, 32]))
     CRITIC = critic.Critic(network=critic_net)
