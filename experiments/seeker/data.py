@@ -5,11 +5,11 @@ from jax import Array
 from jax.random import PRNGKey
 from jax.scipy.stats import uniform
 
-from rp_slac.environment import Environment
+from rp_slac.environment import JAXEnvironment
 
 
 # ===== data generation =====
-class CentreSeekingEnvironment(Environment):
+class CentreSeekingEnvironment(JAXEnvironment):
 
     def __init__(
             self,
