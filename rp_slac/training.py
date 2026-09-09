@@ -82,10 +82,14 @@ class RPSLAC:
 
         return replay_buffer, env_states
     
-    def pretrain_step(self, itr: int, params: AllParams, opt_states: dict[optax.OptState], data: tuple[Array]):
-        new_params, new_opt_states, model_loss, _ = self._update_model(itr, params, opt_states, data)
-        return new_params, new_opt_states, model_loss
 
+    def pretrain_step(self, itr: int, params: AllParams, opt_states: dict[optax.OptState], data: tuple[Array]):
+            model_params, model_opt_states, model_loss, _ = self._update_model(itr, params, opt_states, data)
+            new_params = {**params, **model_params}
+            new_opt_states = {**opt_states, **model_opt_states}
+            return new_params, new_opt_states, model_loss
+
+    
     def train_step(
             self,
             key: PRNGKey,
@@ -96,18 +100,32 @@ class RPSLAC:
     ) -> tuple[dict, dict[optax.OptState], dict[float]]: 
         sample_key, actor_key, critic_key = jr.split(key, 3)
 
-        # run model updates and sample latents
-        params, opt_states, model_loss, posterior = self._update_model(itr, params, opt_states, data)
-        # latents = posterior.params["means"]
-        latents = posterior.sample(sample_key)
+        # calculate all updates from the previous step parameters
+        model_params, model_opt_states, model_loss, posterior = self._update_model(itr, params, opt_states, data)
+        latents = posterior.sample(sample_key)    # latents = posterior.params["means"]
 
-        # run soft actor-critic updates
-        params, opt_states, critic_loss = self._update_critic(critic_key, params, opt_states, latents, data)
-        params, opt_states, actor_loss, aux = self._update_actor(actor_key, params, opt_states, latents, data)
-        params, opt_states, alpha_loss = self._update_alpha(params, opt_states, data)
+        critic_params, critic_opt_state, critic_loss = self._update_critic(critic_key, params, opt_states, latents, data)
+        actor_params, actor_opt_state, actor_loss, aux = self._update_actor(actor_key, params, opt_states, latents, data)
+        log_alpha, alpha_opt_state, alpha_loss = self._update_alpha(params, opt_states, data)
+
+        # combine the independently updated parameter subsets
+        new_params = {
+            **params,
+            **model_params,
+            "critic": critic_params,
+            "actor": actor_params,
+            "log_alpha": log_alpha
+        }
+        new_opt_states = {
+            **opt_states,
+            **model_opt_states,
+            "critic": critic_opt_state,
+            "actor": actor_opt_state,
+            "alpha": alpha_opt_state
+        }
 
         losses = {"model": model_loss, "critic": critic_loss, "actor": actor_loss, "alpha": alpha_loss}
-        return params, opt_states, losses, aux
+        return new_params, new_opt_states, losses, aux
     
 
     def fit(self, use_pbar: bool = True) -> None:
@@ -181,6 +199,7 @@ class RPSLAC:
             )
 
         return self.params, replay_buffer
+    
         
     def init(self, key: PRNGKey, replay_buffer: tuple[Array]):
         """ initialise all agent parameters """
@@ -273,7 +292,7 @@ class RPSLAC:
 
         batch = vmap(sample_buffer)(keys, observations, actions, rewards, discounts, log_probs)
         return tuple(x.reshape((N * B,) + x.shape[2:]) for x in batch)
-
+    
 
     def _update_model(self, itr: int, params, opt_states, data):
         """ Update RPM model parameters using Kalman smoothing """
@@ -297,9 +316,6 @@ class RPSLAC:
             )
             new_params[name] = optax.apply_updates(params[name], updates)
 
-        # return updated params and opt_states
-        new_params = {**params, **new_params}
-        new_opt_states = {**opt_states, **new_opt_states}
         return new_params, new_opt_states, loss, aux["posterior"]
 
 
@@ -319,11 +335,8 @@ class RPSLAC:
         target_update = lambda _tps, _lps: (1.0 - rho) * _tps + rho * _lps
         target_params = tree_map(target_update, params["critic"]["target"], latest_params)
 
-        # return updated params and opt_states
         critic_params = {"latest": latest_params, "target": target_params}
-        new_params = {**params, "critic": critic_params}
-        new_opt_states = {**opt_states, "critic": new_critic_opt_states}
-        return new_params, new_opt_states, loss
+        return critic_params, new_critic_opt_states, loss
 
 
     def _update_actor(self, key, params, opt_states, latents, data):
@@ -337,9 +350,7 @@ class RPSLAC:
         updates, new_actor_opt_states = self.opts["actor"].update(grads["actor"], opt_states["actor"], params["actor"])
         actor_params = optax.apply_updates(params["actor"], updates)
 
-        new_params = {**params, "actor": actor_params}
-        new_opt_states = {**opt_states, "actor": new_actor_opt_states}
-        return new_params, new_opt_states, loss, aux
+        return actor_params, new_actor_opt_states, loss, aux
 
 
     def _update_alpha(self, params, opt_states, data: tuple[Array]):
@@ -352,10 +363,8 @@ class RPSLAC:
                                                              params["log_alpha"])
 
         log_alpha = optax.apply_updates(params["log_alpha"], updates)
-        new_params = {**params,"log_alpha": log_alpha}
-        new_opt_states = {**opt_states, "alpha": alpha_opt_state}
-        return new_params, new_opt_states, loss
-
+        return log_alpha, alpha_opt_state, loss
+    
 
     def _stabilise_params(self):
         # TODO stabilisation would require new Q calculation so needs to go into prior? 
@@ -383,6 +392,122 @@ class RPSLAC:
 
         keys = jr.split(key, observations.shape[0])
         return vmap(lambda _key, state: self.control.policy(_key, params, state))(keys, observations)
+
+
+
+########### OLD SEQUENTIAL UPDATES #############
+
+    # def pretrain_step(self, itr: int, params: AllParams, opt_states: dict[optax.OptState], data: tuple[Array]):
+    #     new_params, new_opt_states, model_loss, _ = self._update_model(itr, params, opt_states, data)
+    #     return new_params, new_opt_states, model_loss
+
+
+    # def train_step(
+    #         self,
+    #         key: PRNGKey,
+    #         itr: int,
+    #         params: AllParams,
+    #         opt_states: dict[optax.OptState],
+    #         data: tuple[Array]
+    # ) -> tuple[dict, dict[optax.OptState], dict[float]]: 
+    #     sample_key, actor_key, critic_key = jr.split(key, 3)
+
+    #     # run model updates and sample latents
+    #     params, opt_states, model_loss, posterior = self._update_model(itr, params, opt_states, data)
+    #     # latents = posterior.params["means"]
+    #     latents = posterior.sample(sample_key)
+
+    #     # run soft actor-critic updates
+    #     params, opt_states, critic_loss = self._update_critic(critic_key, params, opt_states, latents, data)
+    #     params, opt_states, actor_loss, aux = self._update_actor(actor_key, params, opt_states, latents, data)
+    #     params, opt_states, alpha_loss = self._update_alpha(params, opt_states, data)
+
+    #     losses = {"model": model_loss, "critic": critic_loss, "actor": actor_loss, "alpha": alpha_loss}
+    #     return params, opt_states, losses, aux
+
+
+
+    # def _update_model(self, itr: int, params, opt_states, data):
+    #     """ Update RPM model parameters using Kalman smoothing """
+
+    #     beta = self.config.beta_schedule(itr)
+    #     em = self.config.em
+
+    #     obs = data[0]
+    #     actions = data[1]
+
+    #     _params = {"prior": params["prior"], "rpm": params["rpm"]}
+    #     (loss, aux), grads = jax.value_and_grad(self.model.loss, has_aux=True)(_params, obs, actions, beta, em)
+
+    #     new_params = {}
+    #     new_opt_states = {}
+    #     for name in ("prior", "rpm"):
+    #         updates, new_opt_states[name] = self.opts[name].update(
+    #             grads[name],
+    #             opt_states[name],
+    #             params[name]
+    #         )
+    #         new_params[name] = optax.apply_updates(params[name], updates)
+
+    #     # return updated params and opt_states
+    #     new_params = {**params, **new_params}
+    #     new_opt_states = {**opt_states, **new_opt_states}
+    #     return new_params, new_opt_states, loss, aux["posterior"]
+
+
+    # def _update_critic(self, key, params, opt_states, latents, data):
+    #     """ Update soft critic parameters """
+    #     rho = self.config.target_update_rate
+    #     _params = {"actor": params["actor"], "critic": params["critic"], "log_alpha": params["log_alpha"]}
+
+    #     # latest param updates
+    #     loss, grads = jax.value_and_grad(self.control.critic_loss, argnums=1)(key, _params, latents, data)
+    #     latest_updates, new_critic_opt_states = self.opts["critic"].update(grads["critic"]["latest"], 
+    #                                                                        opt_states["critic"], 
+    #                                                                        params["critic"]["latest"])
+    #     latest_params = optax.apply_updates(params["critic"]["latest"], latest_updates)
+
+    #     # target param updates
+    #     target_update = lambda _tps, _lps: (1.0 - rho) * _tps + rho * _lps
+    #     target_params = tree_map(target_update, params["critic"]["target"], latest_params)
+
+    #     # return updated params and opt_states
+    #     critic_params = {"latest": latest_params, "target": target_params}
+    #     new_params = {**params, "critic": critic_params}
+    #     new_opt_states = {**opt_states, "critic": new_critic_opt_states}
+    #     return new_params, new_opt_states, loss
+
+
+    # def _update_actor(self, key, params, opt_states, latents, data):
+    #     """ Update soft actor parameters """
+
+    #     _params = {"actor": params["actor"], "critic": params["critic"], "log_alpha": params["log_alpha"]}
+    #     (loss, aux), grads = jax.value_and_grad(
+    #         self.control.actor_loss, argnums=1, has_aux=True
+    #     )(key, _params, latents, data)
+
+    #     updates, new_actor_opt_states = self.opts["actor"].update(grads["actor"], opt_states["actor"], params["actor"])
+    #     actor_params = optax.apply_updates(params["actor"], updates)
+
+    #     new_params = {**params, "actor": actor_params}
+    #     new_opt_states = {**opt_states, "actor": new_actor_opt_states}
+    #     return new_params, new_opt_states, loss, aux
+
+
+    # def _update_alpha(self, params, opt_states, data: tuple[Array]):
+    #     """ Update log temperature parameter """
+    #     _params = {"log_alpha": params["log_alpha"]}
+    #     loss, grads = jax.value_and_grad(self.control.alpha_loss)(_params, data)
+
+    #     updates, alpha_opt_state = self.opts["alpha"].update(grads["log_alpha"], 
+    #                                                          opt_states["alpha"], 
+    #                                                          params["log_alpha"])
+
+    #     log_alpha = optax.apply_updates(params["log_alpha"], updates)
+    #     new_params = {**params,"log_alpha": log_alpha}
+    #     new_opt_states = {**opt_states, "alpha": alpha_opt_state}
+    #     return new_params, new_opt_states, loss
+
 
 
  # def train_continue(self, data: tuple[Array], new_iter: int, key: Array, y: Array = None):

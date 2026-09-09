@@ -50,8 +50,16 @@ class ActorNetwork(nn.Module):
 
 class Actor:
 
-    def __init__(self,  network: ActorNetwork):
+    def __init__(
+            self,
+            network: ActorNetwork,
+            action_low: Array,
+            action_high: Array,
+        ):
         self.network = network
+
+        self.action_scale = (action_high - action_low) / 2.0
+        self.action_bias = (action_high + action_low) / 2.0
 
     def init(self, key: Array, state: Array):
         """
@@ -60,10 +68,8 @@ class Actor:
         key:   PRNGKey
         data:  Tuple[(B, T, ...)] batched replay buffer
         """
-        params = self.network.init(key, state)
-        return params
+        return self.network.init(key, state)
 
-    
     def apply(self, key: PRNGKey, params, state: Array):
         """
         Network parametrises a differentiable distribution over actions.
@@ -76,14 +82,21 @@ class Actor:
         params:  Network parameters
         data:    State to apply actor to
         """
+
+        # apply network
         nat_params = self.network.apply(params, state)
         dist = nat_params.dist_param
 
+        # squash action to [-1, 1]
         raw_action = dist.sample(key=key, shape=())
+        squashed_action = jnp.tanh(raw_action)
 
-        action = jnp.tanh(raw_action)
+        # affine transormation to actual action space
+        action = self.action_bias + self.action_scale * squashed_action
+
+        # calculate log pi(a_t | s_t) and jacobian for tanh squash
         log_prob = dist.log_prob(raw_action)
-        log_prob -= jnp.sum(jnp.log(1.0 - action ** 2 + 1e-6))
+        log_prob -= jnp.sum(jnp.log(self.action_scale) + jnp.log(1.0 - squashed_action ** 2 + 1e-6))
 
         return action, log_prob
 
@@ -94,10 +107,55 @@ class Actor:
         mean = dist.params["mean"]
         std = jnp.sqrt(jnp.diag(dist.params["cov"]))
 
-        return jnp.tanh(mean), std
+        action = self.action_bias + self.action_scale * jnp.tanh(mean)
+        return action, std
 
 
+
+# class Actor:
+
+#     def __init__(self,  network: ActorNetwork):
+#         self.network = network
+
+#     def init(self, key: Array, state: Array):
+#         """
+#         Parameters
+#         ----------
+#         key:   PRNGKey
+#         data:  Tuple[(B, T, ...)] batched replay buffer
+#         """
+#         params = self.network.init(key, state)
+#         return params
 
     
+#     def apply(self, key: PRNGKey, params, state: Array):
+#         """
+#         Network parametrises a differentiable distribution over actions.
+#         Sample the action.
+#         Calculate the log probability of this action.
+#         Gradients wrt to actor.apply are therefore: d log[p(a | s)]
 
+#         Parameters
+#         ----------
+#         params:  Network parameters
+#         data:    State to apply actor to
+#         """
+#         nat_params = self.network.apply(params, state)
+#         dist = nat_params.dist_param
 
+#         raw_action = dist.sample(key=key, shape=())
+
+#         action = jnp.tanh(raw_action)
+#         log_prob = dist.log_prob(raw_action)
+#         log_prob -= jnp.sum(jnp.log(1.0 - action ** 2 + 1e-6))
+
+#         return action, log_prob
+
+#     def stats(self, params, state):
+#         nat_params = self.network.apply(params, state)
+#         dist = nat_params.dist_param
+
+#         mean = dist.params["mean"]
+#         std = jnp.sqrt(jnp.diag(dist.params["cov"]))
+
+#         return jnp.tanh(mean), std
