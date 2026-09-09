@@ -1,5 +1,6 @@
 import flax.linen as nn
 
+import jax.numpy as jnp
 from jax import Array
 from typing import Sequence
 
@@ -27,3 +28,26 @@ class CNN(nn.Module):
             x = nn.relu(x)
         return x.flatten()
 
+
+class DenseCNN(nn.Module):
+    """ CNN with optional fully connected layers and no output layer. """
+    cnn_features: Sequence[dict]
+    mlp_features: Sequence[int] = ()
+
+    @nn.compact
+    def __call__(self, x: Array) -> Array:
+
+        # dm_control returns uint8 pixels
+        # x = x.astype(jnp.float32) / 255.0
+
+        for feat in self.cnn_features:
+            x = nn.Conv(**feat)(x)
+            x = nn.relu(x)
+
+        x = x.reshape(-1)
+
+        for feat in self.mlp_features:
+            x = nn.Dense(feat)(x)
+            x = nn.relu(x)
+
+        return x
