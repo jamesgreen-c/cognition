@@ -1,5 +1,6 @@
 from abc import ABC, abstractmethod
 
+import numpy as np
 import jax.numpy as jnp
 import jax.random as jr
 
@@ -8,9 +9,13 @@ from typing import Callable
 from jax import Array, lax, vmap
 from jax.random import PRNGKey
 
+from abc import ABC, abstractmethod
+from typing import Callable
 
 
-class Environment(ABC):
+class JAXEnvironment(ABC):
+
+    jax_compatible = True
 
     def __init__(self):
         pass
@@ -184,6 +189,257 @@ class Environment(ABC):
         pass
 
     @abstractmethod
-    def random_action(self, key: PRNGKey, state: Array):
+    def random_action(self, key: PRNGKey, observation: Array):
         """Sample a valid action for replay-buffer initialisation."""
         pass
+
+
+class MuJoCoSimulationEnvironment(ABC):
+    """
+    Base class for stateful MuJoCo environments.
+
+    Each chronological replay buffer owns one persistent simulator.
+    Calling sample() advances every simulator by exactly num_steps
+    agent transitions.
+    """
+
+    jax_compatible = False
+
+    def __init__(
+            self,
+            num_buffers: int,
+            action_repeat: int = 1,
+        ):
+        if num_buffers < 1:
+            raise ValueError("num_buffers must be positive.")
+
+        if action_repeat < 1:
+            raise ValueError("action_repeat must be positive.")
+
+        self.num_buffers = num_buffers
+        self.action_repeat = action_repeat
+        self.envs = [None] * num_buffers
+
+    @abstractmethod
+    def _make_env(self, seed: int):
+        """Construct one independently seeded simulator."""
+        pass
+
+    @abstractmethod
+    def _state(self, env) -> Array:
+        """Extract the ground-truth state from a simulator."""
+        pass
+
+    @abstractmethod
+    def _observation(self, env) -> Array:
+        """Extract the observation given to the agent."""
+        pass
+
+    @abstractmethod
+    def _step_simulator(self, env, action: Array):
+        """
+        Apply an action for one native simulator step.
+
+        Returns
+        -------
+        reward:    Reward for the native step.
+        terminal:  Whether the episode has ended.
+        """
+        pass
+
+    @abstractmethod
+    def _action_bounds(self) -> tuple[Array, Array]:
+        """Return the lower and upper action bounds."""
+        pass
+
+    def _reset(self, env):
+        env.reset()
+        return self._state(env), self._observation(env)
+
+    def _step(self, env, action: Array):
+        """
+        Apply one agent action, including action repetition.
+        """
+        reward = 0.0
+        terminal = False
+
+        for _ in range(self.action_repeat):
+            step_reward, terminal = self._step_simulator(env, action)
+            reward += step_reward
+
+            if terminal:
+                break
+
+        return (
+            self._state(env),
+            self._observation(env),
+            jnp.asarray(reward),
+            terminal,
+        )
+
+    def sample(
+            self,
+            key: PRNGKey,
+            policy: Callable,
+            num_samples: int,
+            num_steps: int,
+            state_0: Array | None = None,
+        ):
+        """
+        Advance each persistent simulator by num_steps transitions.
+
+        Parameters
+        ----------
+        key:          JAX random key.
+        policy:       Callable with signature
+                          action, log_prob = policy(key, observation)
+        num_samples:  Number of chronological replay buffers.
+        num_steps:    Number of new transitions per buffer.
+        state_0:      Accepted for compatibility with the pure JAX
+                      Environment interface. Persistent simulators retain
+                      their own complete internal states.
+
+        Returns
+        -------
+        final_states:  (M, *D)
+        states:        (M, num_steps + 1, *D)
+        observations:  (M, num_steps + 1, *O)
+        actions:       (M, num_steps, *K)
+        rewards:       (M, num_steps)
+        flags:         (M, num_steps)
+        log_probs:     (M, num_steps)
+        """
+        if num_samples != self.num_buffers:
+            raise ValueError(f"Expected num_samples={self.num_buffers}, received {num_samples}.")
+
+        if num_steps < 1:
+            raise ValueError("num_steps must be positive.")
+
+        buffer_keys = jr.split(key, num_samples)
+        outputs = [
+            self._sample_single(
+                key=buffer_keys[m],
+                policy=policy,
+                num_steps=num_steps,
+                buffer_idx=m,
+            )
+            for m in range(num_samples)
+        ]
+
+        return tuple(jnp.stack([output[i] for output in outputs]) for i in range(7))
+
+    def _sample_single(
+            self,
+            key: PRNGKey,
+            policy: Callable,
+            num_steps: int,
+            buffer_idx: int,
+        ):
+        """
+        Advance one persistent simulator by num_steps transitions.
+        """
+        init_key, sample_key = jr.split(key)
+        env = self.envs[buffer_idx]
+
+        if env is None:
+            seed = int(jr.randint(init_key, (), 0, 2 ** 31 - 1))
+            env = self._make_env(seed)
+            self.envs[buffer_idx] = env
+            state, observation = self._reset(env)
+        else:
+            state = self._state(env)
+            observation = self._observation(env)
+
+        states = [state]
+        observations = [observation]
+        actions = []
+        rewards = []
+        flags = []
+        log_probs = []
+
+        step_keys = jr.split(sample_key, num_steps)
+
+        for step_key in step_keys:
+            action, log_prob = policy(step_key, observation)
+            next_state, next_observation, reward, terminal = self._step(env, action)
+
+            actions.append(jnp.asarray(action))
+            rewards.append(reward)
+            flags.append(jnp.asarray(1.0 - float(terminal)))
+            log_probs.append(jnp.asarray(log_prob))
+
+            if terminal:
+                next_state, next_observation = self._reset(env)
+
+            states.append(next_state)
+            observations.append(next_observation)
+
+            state = next_state
+            observation = next_observation
+
+        return (
+            state,
+            jnp.stack(states),
+            jnp.stack(observations),
+            jnp.stack(actions),
+            jnp.stack(rewards),
+            jnp.stack(flags),
+            jnp.stack(log_probs),
+        )
+
+    def random_action(self, key: PRNGKey, observation: Array):
+        """
+        Sample uniformly over the valid action space.
+        """
+        lower, upper = self._action_bounds()
+        action = jr.uniform(key, shape=lower.shape, minval=lower, maxval=upper)
+        log_prob = -jnp.log(upper - lower).sum()
+        return action, log_prob
+
+    def evaluate(
+        self,
+        key: PRNGKey,
+        policy: Callable,
+        num_episodes: int = 10,
+    ):
+        """
+        Evaluate a policy using fresh, independent complete episodes.
+
+        The returned episode returns are undiscounted sums of all native
+        rewards, including rewards accumulated by action repetition.
+        """
+        episode_keys = jr.split(key, num_episodes)
+        episode_returns = []
+        episode_lengths = []
+
+        for episode_key in episode_keys:
+            init_key, policy_key = jr.split(episode_key)
+            seed = int(jr.randint(init_key, (), 0, 2 ** 31 - 1))
+
+            env = self._make_env(seed)
+            _, observation = self._reset(env)
+
+            episode_return = 0.0
+            episode_length = 0
+            terminal = False
+
+            while not terminal:
+                policy_key, action_key = jr.split(policy_key)
+                action, _ = policy(action_key, observation)
+                _, observation, reward, terminal = self._step(env, action)
+
+            episode_return += float(reward)
+            episode_length += self.action_repeat
+
+        episode_returns.append(episode_return)
+        episode_lengths.append(episode_length)
+
+        episode_returns = np.asarray(episode_returns)
+        episode_lengths = np.asarray(episode_lengths)
+
+        return {
+            "mean_return": episode_returns.mean(),
+            "std_return": episode_returns.std(ddof=1),
+            "episode_returns": episode_returns,
+            "episode_lengths": episode_lengths,
+        }

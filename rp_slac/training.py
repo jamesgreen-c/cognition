@@ -5,14 +5,14 @@ import jax.random as jr
 import jax.numpy as jnp
 
 from tqdm import tqdm
-from typing import Callable, Any
+from typing import Callable, Union
 
 from jax import Array, vmap
 from jax.random import PRNGKey
 from jax.tree_util import tree_map
 from jax.lax import stop_gradient as stopgrad
 
-from rp_slac.environment import Environment
+from rp_slac.environment import JAXEnvironment, MuJoCoSimulationEnvironment
 from rp_slac.free_energy.model_fe import ConstrainedIVFreeEnergy
 from rp_slac.free_energy.control_fe import ControlFreeEnergy
 
@@ -34,7 +34,7 @@ class RPSLAC:
             self,
             model: ConstrainedIVFreeEnergy,
             control: ControlFreeEnergy, 
-            environment: Environment,
+            environment: Union[JAXEnvironment, MuJoCoSimulationEnvironment],
             config: Config,
             logger: Callable = lambda *x: {}
     ):
@@ -140,7 +140,12 @@ class RPSLAC:
         replay_buffer, env_states = self._init_replay_buffer(buffer_key)
         self.params, self.opt_states, self.opts = self.init(init_key, replay_buffer)
 
-        experience_step = jax.jit(self.experience_step) if self.config.jit else self.experience_step
+        # experience_step = jax.jit(self.experience_step) if self.config.jit else self.experience_step
+        experience_step = (
+            jax.jit(self.experience_step)
+            if self.config.jit and self.env.jax_compatible
+            else self.experience_step
+        )
         pretrain_step = jax.jit(self.pretrain_step) if self.config.jit else self.pretrain_step
         train_step = jax.jit(self.train_step) if self.config.jit else self.train_step
 
