@@ -40,6 +40,38 @@ class MVNDiag(DistMap):
         return GaussianNatParam(p=p, pwm=pwm)
 
 
+class SLACMVNDiag(DistMap):
+    """Diagonal Gaussian parametrised by mean and clipped log-standard-deviation."""
+
+    def __init__(
+            self,
+            latent_dim: int,
+            min_log_std: float = -20.0,
+            max_log_std: float = 2.0,
+        ):
+        super().__init__(latent_dim)
+        self.min_log_std = min_log_std
+        self.max_log_std = max_log_std
+
+    @property
+    def input_dim(self):
+        return self.latent_dim * 2
+
+    def __call__(self, x: Array) -> GaussianNatParam:
+        mean = x[:self.latent_dim]
+        log_std = x[self.latent_dim:]
+
+        # bound the standard deviation
+        log_std = jnp.clip(log_std, self.min_log_std, self.max_log_std)
+
+        # convert to natural parameters
+        precision_diag = jnp.exp(-2.0 * log_std)
+        p = jnp.diag(precision_diag)
+        pwm = precision_diag * mean
+
+        return GaussianNatParam(p=p, pwm=pwm)
+
+
 class MVNCholesky(DistMap):
 
     @property

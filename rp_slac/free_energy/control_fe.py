@@ -93,7 +93,7 @@ class ControlFreeEnergy:
         # get loss terms
         values_1, values_2 = self.vmapped_latest_critic(params["critic"], latent, actions)   # (B,), (B,)
         values = jnp.minimum(values_1, values_2)                                             # (B,)
-        terms = (alpha * log_probs) - values                                      # (B,)
+        terms = (alpha * log_probs) - values                                                 # (B,)
         loss = terms.mean()
         # loss =  terms.sum() / (self.batch_size * self.num_buffers)
 
