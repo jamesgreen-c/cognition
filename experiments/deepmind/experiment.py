@@ -126,6 +126,7 @@ def evaluate_policy(trainer: RPSLAC):
     key = jr.PRNGKey(args.seed + 10)
 
     def policy(policy_key, observation):
+        observation = trainer.env.preprocess_observation(observation)
         return trainer.control.policy(
             policy_key,
             trainer.params,

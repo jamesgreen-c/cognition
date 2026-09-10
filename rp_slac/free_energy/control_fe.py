@@ -47,7 +47,7 @@ class ControlFreeEnergy:
         """
         action_dim = data[1].shape[-1]
 
-        self.batch_size = config.batch_size
+        self.batch_size = config.control_batch_size
         self.num_buffers = config.num_buffers
         self.gamma = config.gamma
         self.actor_state = config.actor_state
@@ -95,7 +95,6 @@ class ControlFreeEnergy:
         values = jnp.minimum(values_1, values_2)                                             # (B,)
         terms = (alpha * log_probs) - values                                                 # (B,)
         loss = terms.mean()
-        # loss =  terms.sum() / (self.batch_size * self.num_buffers)
 
         aux = {"mean": means, "std": stds}
         return loss, aux
@@ -130,7 +129,6 @@ class ControlFreeEnergy:
         target = stopgrad(reward + self.gamma * discount * diff)                    # (B,)
         terms = jnp.square(values_1 - target) + jnp.square(values_2 - target)       # (B,)
         loss = 0.5 * terms.mean()
-        # loss = terms.sum() / (2 * self.batch_size * self.num_buffers) 
 
         return loss
 

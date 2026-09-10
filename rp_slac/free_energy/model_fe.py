@@ -29,7 +29,7 @@ class ConstrainedIVFreeEnergy:
         observations, *_ = data
 
         self.num_timesteps = config.sequence_length + 1
-        self.batch_size = config.batch_size
+        self.batch_size = config.model_batch_size
         self.num_buffers = config.num_buffers
         self.num_factors = 1
 
