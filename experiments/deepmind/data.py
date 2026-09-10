@@ -62,3 +62,7 @@ class DmControlEnvironment(MuJoCoSimulationEnvironment):
 
     def _action_bounds(self):
         return self.action_lower, self.action_upper
+
+    # override preprocess
+    def preprocess_observation(self, observation: Array) -> Array:
+        return observation.astype(jnp.float32) / 255.0

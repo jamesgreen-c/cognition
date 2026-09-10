@@ -54,7 +54,12 @@ class RPSLAC:
     def experience_step(self, key: PRNGKey, params: dict, env_states: Array, data: tuple[Array]):
 
         K = self.config.collection_steps
-        policy = lambda _k, _state: self.control.policy(_k, params, _state)
+
+        def policy(_key, _observation):
+            _observation = self.env.preprocess_observation(_observation)
+            return self.control.policy(_key, params, _observation)
+            
+        # policy = lambda _k, _state: self.control.policy(_k, params, _state)
 
         # sample K new steps from environment
         if self.config.actor_state == "observation":
@@ -96,17 +101,18 @@ class RPSLAC:
             itr: int,
             params: AllParams,
             opt_states: dict[optax.OptState],
-            data: tuple[Array]
+            model_data: tuple[Array],
+            control_data: tuple[Array]
     ) -> tuple[dict, dict[optax.OptState], dict[float]]: 
         sample_key, actor_key, critic_key = jr.split(key, 3)
 
         # calculate all updates from the previous step parameters
-        model_params, model_opt_states, model_loss, posterior = self._update_model(itr, params, opt_states, data)
+        model_params, model_opt_states, model_loss, posterior = self._update_model(itr, params, opt_states, model_data)
         latents = posterior.sample(sample_key)    # latents = posterior.params["means"]
 
-        critic_params, critic_opt_state, critic_loss = self._update_critic(critic_key, params, opt_states, latents, data)
-        actor_params, actor_opt_state, actor_loss, aux = self._update_actor(actor_key, params, opt_states, latents, data)
-        log_alpha, alpha_opt_state, alpha_loss = self._update_alpha(params, opt_states, data)
+        critic_params, critic_opt_state, critic_loss = self._update_critic(critic_key, params, opt_states, latents, control_data)
+        actor_params, actor_opt_state, actor_loss, aux = self._update_actor(actor_key, params, opt_states, latents, control_data)
+        log_alpha, alpha_opt_state, alpha_loss = self._update_alpha(params, opt_states, control_data)
 
         # combine the independently updated parameter subsets
         new_params = {
@@ -155,7 +161,7 @@ class RPSLAC:
         pbar = tqdm(range(self.config.num_pretrain), disable=not(use_pbar), desc="Pretraining")
         for self.pretrain_itr in pbar:
             key, subkey = jr.split(key)
-            batch = self._get_batch(subkey, replay_buffer)
+            batch = self._get_batch(subkey, replay_buffer, batch_size=self.config.model_batch_size)
 
             self.params, self.opt_states, loss = pretrain_step(self.pretrain_itr, self.params, self.opt_states, batch)
             self._stabilise_params()
@@ -178,9 +184,15 @@ class RPSLAC:
             key, collection_key, batch_key, train_key = jr.split(key, 4)
 
             replay_buffer, env_states = experience_step(collection_key, self.params, env_states, replay_buffer)
-            batch = self._get_batch(batch_key, replay_buffer)
+            model_batch = self._get_batch(batch_key, replay_buffer, batch_size=self.config.model_batch_size)
+            control_batch = self._get_batch(batch_key, replay_buffer, batch_size=self.config.control_batch_size)
             
-            self.params, self.opt_states, losses, aux = train_step(train_key, self.itr, self.params, self.opt_states, batch)
+            self.params, self.opt_states, losses, aux = train_step(train_key, 
+                                                                   self.itr, 
+                                                                   self.params, 
+                                                                   self.opt_states, 
+                                                                   model_batch,
+                                                                   control_batch)
             self._stabilise_params()
 
             # calculate average reward
@@ -243,7 +255,7 @@ class RPSLAC:
         return (observations, actions, rewards, flags, log_probs), env_states
     
 
-    def _get_batch(self, key: PRNGKey, replay_buffer: tuple[Array]):
+    def _get_batch(self, key: PRNGKey, replay_buffer: tuple[Array], batch_size: int):
         """
         Sample B contiguous windows independently from each of N buffers,
         without crossing episode boundaries.
@@ -258,7 +270,7 @@ class RPSLAC:
         observations, actions, rewards, discounts, log_probs = replay_buffer
 
         N = self.config.num_buffers
-        B = self.config.batch_size
+        B = batch_size
         tau = self.config.sequence_length
         capacity = actions.shape[1]
 
@@ -296,8 +308,12 @@ class RPSLAC:
             return vmap(sample_window)(starts)
 
         batch = vmap(sample_buffer)(keys, observations, actions, rewards, discounts, log_probs)
-        return tuple(x.reshape((N * B,) + x.shape[2:]) for x in batch)
-    
+        batch = tuple(x.reshape((N * B,) + x.shape[2:]) for x in batch)
+
+        observations, actions, rewards, discounts, log_probs = batch
+        observations = self.env.preprocess_observation(observations)
+
+        return (observations, actions, rewards, discounts, log_probs)
 
     def _update_model(self, itr: int, params, opt_states, data):
         """ Update RPM model parameters using Kalman smoothing """
@@ -389,6 +405,8 @@ class RPSLAC:
         params:        Trained model and control parameters
         obseravtions:  (B, D) or (D,) for a set of B (or one) observations 
         """
+        observations = self.env.preprocess_observation(observations)
+
         if observations.ndim == 1:
             observations = observations[None]
 

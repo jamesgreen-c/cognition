@@ -112,6 +112,10 @@ class JAXEnvironment(ABC):
         observations = jnp.concatenate([obs_0[None], observations], axis=0)
         return final_state, states, observations, actions, rewards, flags, log_probs
 
+    def preprocess_observation(self, observation: Array) -> Array:
+        """Transform raw observations before passing them to a network."""
+        return observation
+
     def is_terminal_state(self, state: Array) -> Array:
         """
         Return whether the state terminates the current episode.
@@ -395,6 +399,10 @@ class MuJoCoSimulationEnvironment(ABC):
         action = jr.uniform(key, shape=lower.shape, minval=lower, maxval=upper)
         log_prob = -jnp.log(upper - lower).sum()
         return action, log_prob
+
+    def preprocess_observation(self, observation: Array) -> Array:
+        """Transform raw observations before passing them to a network."""
+        return observation
 
     def evaluate(
         self,
