@@ -1,10 +1,32 @@
 import os
+import argparse
 
+# ARGS PARSING
+parser = argparse.ArgumentParser()
+parser.add_argument("--domain", type=str, default="cheetah")
+parser.add_argument("--task", type=str, default="run")
+parser.add_argument("--action-repeat", type=int, default=1)
+parser.add_argument("--N", type=int, default=1)
+parser.add_argument("--D", type=int, default=32)
+parser.add_argument("--T", type=int, default=8)
+parser.add_argument("--stabilise", type=str, default="clip")
+parser.add_argument("--gamma", type=float, default=0.99)
+parser.add_argument("--pretrain-iter", type=int, default=3000)
+parser.add_argument("--num-iter", type=int, default=2500)
+parser.add_argument("--batch-size", type=int, default=32)
+parser.add_argument("--capacity", type=int, default=2500)
+parser.add_argument("--collection-steps", type=int, default=1)
+parser.add_argument("--eval-episodes", type=int, default=10)
+parser.add_argument("--seed", type=int, default=1234)
+parser.add_argument("--debug", action="store_true")
+parser.add_argument("--platform", choices=("cpu", "cuda"), default="cuda")
+args = parser.parse_args()
+
+os.environ["JAX_PLATFORMS"] = args.platform
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 os.environ["XLA_FLAGS"] = "--xla_gpu_enable_triton_gemm=false"
 
 import pickle
-import argparse
 
 import numpy as np
 import jax.random as jr
@@ -14,42 +36,14 @@ from rp_slac.training import RPSLAC
 from experiments.deepmind.data import DmControlEnvironment
 from experiments.deepmind.setup import setup
 
-
-# ARGS PARSING
-parser = argparse.ArgumentParser()
-
-parser.add_argument("--domain", type=str, default="cheetah")
-parser.add_argument("--task", type=str, default="run")
-parser.add_argument("--action-repeat", type=int, default=1)
-
-parser.add_argument("--N", type=int, default=4)
-parser.add_argument("--D", type=int, default=32)
-parser.add_argument("--T", type=int, default=8)
-
-parser.add_argument("--stabilise", type=str, default="clip")
-parser.add_argument("--gamma", type=float, default=0.99)
-
-parser.add_argument("--pretrain-iter", type=int, default=3000)
-parser.add_argument("--num-iter", type=int, default=250000)
-parser.add_argument("--batch-size", type=int, default=8)
-parser.add_argument("--capacity", type=int, default=5000)
-parser.add_argument("--collection-steps", type=int, default=1)
-
-parser.add_argument("--eval-episodes", type=int, default=10)
-parser.add_argument("--seed", type=int, default=1234)
-parser.add_argument("--debug", action="store_true")
-
-args = parser.parse_args()
-
 # SETUP
 ENV = DmControlEnvironment(
     domain_name="cheetah",
     task_name="run",
-    num_buffers=args.num_buffers,
+    num_buffers=args.N,
     action_repeat=1,
     width=64,
     height=64,
-    camera_id=0,
 )
 
 CONFIG, MODEL_FE, CONTROL_FE = setup(
