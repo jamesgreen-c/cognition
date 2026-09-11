@@ -46,8 +46,7 @@ class OptimConfig:
 @dataclass
 class Config:
     # replay sampling
-    model_batch_size: int = 32     # B windows from each replay buffer for model training
-    control_batch_size: int = 128  # B windows from each replay buffer for control training
+    batch_size: int = 32           # B windows from each replay buffer
     sequence_length: int = 50      # tau transitions; observations have tau + 1
     num_buffers: int = 1           # N independent chronological buffers
 
@@ -55,8 +54,9 @@ class Config:
     num_pretrain: int = 1000
     num_iter: int = 1000
 
+    initial_steps: int = 500
     collection_steps: int = 1
-    capacity: int = 500
+    capacity: int = 2500
 
     # control
     gamma: float = 0.99

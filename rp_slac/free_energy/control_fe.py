@@ -47,7 +47,7 @@ class ControlFreeEnergy:
         """
         action_dim = data[1].shape[-1]
 
-        self.batch_size = config.control_batch_size
+        self.batch_size = config.batch_size
         self.num_buffers = config.num_buffers
         self.gamma = config.gamma
         self.actor_state = config.actor_state
