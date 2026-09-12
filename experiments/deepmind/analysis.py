@@ -10,17 +10,15 @@ import numpy as np
 parser = argparse.ArgumentParser()
 parser.add_argument("--N", dest="N", type=int, default=1)
 parser.add_argument("--D", dest="D", type=int, default=10)
-parser.add_argument("--T", dest="T", type=int, default=50)
-
+parser.add_argument("--T", dest="T", type=int, default=8)
+parser.add_argument("--pixels", type=int, default=64)
+parser.add_argument("--rgb", action="store_true")
 parser.add_argument("--stabilise", dest="stabilise", default="clip")
 parser.add_argument("--gamma", dest="gamma", type=float, default=0.99)
-
 parser.add_argument("--pretrain-iter", dest="pretrain_iter", type=int, default=3000)
-parser.add_argument("--num-iter", dest="num_iter", type=int, default=2300)
+parser.add_argument("--num-iter", dest="num_iter", type=int, default=5000)
 parser.add_argument("--batch-size", dest="batch_size", type=int, default=32)
-
 parser.add_argument("--seed", dest="seed", type=int, default=1234)
-
 parser.add_argument("--debug", dest="debug", action="store_true")
 parser.add_argument("--no-debug", dest="debug", action="store_false")
 parser.set_defaults(debug=False)
@@ -29,7 +27,7 @@ args = parser.parse_args()
 
 
 # LOAD SAVED DATA, PARAMS and LOSS
-EXPERIMENT_NAME = f"D={args.D},N={args.N},T={args.T},iter={args.num_iter},stabilise={args.stabilise},seed={args.seed}"
+EXPERIMENT_NAME = f"D={args.D},N={args.N},T={args.T},iter={args.num_iter},rgb={args.rgb},pixels={args.pixels},stabilise={args.stabilise},seed={args.seed}"
 DIRPATH = f"results/{EXPERIMENT_NAME}"
 
 if not os.path.exists(DIRPATH):
@@ -53,9 +51,6 @@ with open(f"{DIRPATH}/log_alphas.pkl", "rb") as f:
 with open(f"{DIRPATH}/actor_stats.pkl", "rb") as f:
     ACTOR_STATS = pickle.load(f)
 
-with open(f"{DIRPATH}/action_grid.pkl", "rb") as f:
-    ACTION_GRID = pickle.load(f)
-
 PLOTDIR = f"{DIRPATH}/plots"
 if not os.path.exists(PLOTDIR):
     os.mkdir(PLOTDIR)
@@ -63,9 +58,9 @@ if not os.path.exists(PLOTDIR):
 
 def plot_loss():
     model_losses = LOSS["model"]
-    critic_losses = LOSS["critic"]
-    actor_losses = LOSS["actor"]
-    alpha_losses = LOSS["alpha"]
+    critic_losses = LOSS["critic"][5:]      # exclude potential extreme losses for random initialisations
+    actor_losses = LOSS["actor"][5:]
+    alpha_losses = LOSS["alpha"][5:]
 
     def _plot(_loss, _name):
         plt.figure(figsize=(15, 5))
@@ -84,7 +79,7 @@ def plot_loss():
 
 
 def plot_buffer():
-    obs, actions, rewards, flags, log_probs = BUFFER["data"]
+    _, actions, rewards, flags, log_probs = BUFFER["data"]
 
     def _plot(_series, _name):
         plt.figure(figsize=(15, 5))
@@ -99,24 +94,6 @@ def plot_buffer():
     _plot(actions[0], "actions")
     _plot(rewards[0], "rewards")
 
-    fig, ax = plt.subplots(2, 1, figsize=(15, 10))
-
-    # pos
-    ax[0].plot(obs[0, :, 0], label="position")
-    ax[0].set_title("Position over training iterations")
-    ax[0].set_xlabel("Iteration")
-    ax[0].set_ylabel("Position")
-
-    # vels
-    ax[1].plot(obs[0, :, 1], label="velocity")
-    ax[1].set_title("Velocity over training iterations")
-    ax[1].set_xlabel("Iteration")
-    ax[1].set_ylabel("Velocity")
-
-    plt.tight_layout()
-    plt.savefig(f"{PLOTDIR}/observations.png")
-    plt.close()
-    
     
 def plot_rpm_params():
     """
@@ -159,41 +136,6 @@ def plot_actor_stats():
     _plot(stds.mean(axis=1), "actor_std")
 
 
-def plot_action_grid():
-    positions = ACTION_GRID["positions"]
-    velocities = ACTION_GRID["velocities"]
-    actions = ACTION_GRID["actions"]
-
-    plt.figure(figsize=(10, 7))
-
-    contour = plt.contourf(
-        positions,
-        velocities,
-        actions,
-        levels=50,
-        cmap="coolwarm",
-        vmin=-1.0,
-        vmax=1.0,
-    )
-
-    plt.colorbar(contour, label="Action")
-    plt.contour(
-        positions,
-        velocities,
-        actions,
-        levels=[0.0],
-        colors="black",
-        linewidths=1.5,
-    )
-
-    plt.xlabel("Position")
-    plt.ylabel("Velocity")
-    plt.title("Actor action surface")
-    plt.tight_layout()
-    plt.savefig(f"{PLOTDIR}/action_surface.png")
-    plt.close()
-
-
 def plot_training_stats():
 
     average_rewards = REWARDS
@@ -221,4 +163,3 @@ if __name__ == "__main__":
     plot_loss()
     plot_rpm_params()
     plot_actor_stats()
-    plot_action_grid()

@@ -3,7 +3,6 @@ import jax.random as jr
 
 from jax import Array
 from jax.random import PRNGKey
-from jax.scipy.stats import uniform
 
 from rp_slac.environment import JAXEnvironment
 
@@ -14,12 +13,13 @@ class CentreSeekingEnvironment(JAXEnvironment):
     def __init__(
             self,
             T: int,
+            actor_history: int = 1,
             velocity_decay: float = 0.9,
             action_scale: float = 0.2,
             velocity_scale: float = 0.1,
             process_std: float = 0.01,
     ):
-        super().__init__()
+        super().__init__(actor_history=actor_history)
         self.T = T
         self.velocity_decay = velocity_decay
         self.action_scale = action_scale
@@ -33,6 +33,7 @@ class CentreSeekingEnvironment(JAXEnvironment):
         return jnp.array([position, velocity])
 
     def observe(self, key: PRNGKey, state: Array):
+        del key
         position, velocity = state
         # return jnp.array([
         #     position,
@@ -65,12 +66,11 @@ class CentreSeekingEnvironment(JAXEnvironment):
         reward -= 0.05 * action**2
         return next_state, reward
 
-    def random_action(self, key: PRNGKey, state):
-        """
-        take random actions initially. Must be atleast 1D
-        """
+    def random_action(self, key: PRNGKey, observation: Array):
+        """Sample a one-dimensional action for replay prefill."""
+        del observation
         action = jr.uniform(key, (1,), minval=-1.0, maxval=1.0)
-        log_prob = uniform.logpdf(action, loc=-1, scale=2).sum()
+        log_prob = -jnp.log(jnp.asarray(2.0, dtype=action.dtype))
         return action, log_prob
 
     def is_terminal_state(self, state):

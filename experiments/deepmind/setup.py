@@ -15,18 +15,19 @@ from rp_slac.free_energy.control_fe import ControlFreeEnergy
 def setup(
         sequence_length: int,
         latent_dim: int,
+        actor_history: int,
         action_dim: int,
         action_low: Array,
         action_high: Array,
         batch_size: int,
+        pixels: int,
         num_buffers: int,
         pretrain_iter: int,
         num_iter: int,
-        collection_steps: int,
         capacity: int,
         gamma: float,
         seed: int,
-        stabilise_A: str | None = None,
+        stabilise_A: str | None = "scale",
 ):
     D = latent_dim
     K = action_dim
@@ -37,14 +38,22 @@ def setup(
         num_iter=num_iter,
         batch_size=batch_size,
         num_buffers=num_buffers,
-        collection_steps=collection_steps,
+        actor_history=actor_history,
         capacity=capacity,
         gamma=gamma,
         actor_state="observation",
         jit=True,
         stabilise_A=stabilise_A,
         seed=seed,
+        target_update_rate=0.005
     )
+
+    # learning rates
+    CFG.prior.lr = 1e-4
+    CFG.recognition.lr = 3e-4
+    CFG.actor.lr = 3e-4
+    CFG.critic.lr = 3e-4
+    CFG.alpha.lr = 3e-4
 
     # prior definition
     A = jnp.zeros((D, D))
@@ -52,12 +61,13 @@ def setup(
     PRIOR = distributions.LGStationaryParam(stationary=True, A=A, B=B)
 
     # recognition definition
+    last_kernel = (pixels + 15) // 16
     cnn_features = [
         {"features": 32, "kernel_size": (5, 5), "strides": (2, 2), "padding": "SAME"},
         {"features": 64, "kernel_size": (3, 3), "strides": (2, 2), "padding": "SAME"},
         {"features": 128, "kernel_size": (3, 3), "strides": (2, 2), "padding": "SAME"},
         {"features": 256, "kernel_size": (3, 3), "strides": (2, 2), "padding": "SAME"},
-        {"features": 256, "kernel_size": (4, 4), "strides": (1, 1), "padding": "VALID"},
+        {"features": 256, "kernel_size": (last_kernel, last_kernel), "strides": (1, 1), "padding": "VALID"},
     ]
 
     REC = rpm.GaussianRecognition(
@@ -87,3 +97,4 @@ def setup(
     CONTROL_FE = ControlFreeEnergy(actor=ACTOR, critic=CRITIC)
 
     return CFG, MODEL_FE, CONTROL_FE
+

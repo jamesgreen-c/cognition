@@ -1,7 +1,6 @@
 import jax.numpy as jnp
 import mujoco
 
-from jax import Array
 from mujoco import mjx
 from mujoco_playground import dm_control_suite as suite
 
@@ -71,9 +70,12 @@ class DmControlEnvironment(MuJoCoSimulationEnvironment):
             domain_name: str,
             task_name: str,
             num_buffers: int,
+            actor_history: int,
             action_repeat: int = 1,
+            episode_length: int = 1000,
             width: int = 64,
             height: int = 64,
+            rgb: bool = False,
             camera_id: int | str | None = None,
         ):
         key = (domain_name, task_name)
@@ -86,9 +88,15 @@ class DmControlEnvironment(MuJoCoSimulationEnvironment):
         self.env_name = _ENV_NAMES[key]
         self.width = width
         self.height = height
+        self.rgb = rgb
         self.camera = _DEFAULT_CAMERAS[self.env_name] if camera_id is None else camera_id
 
-        super().__init__(num_buffers=num_buffers, action_repeat=action_repeat)
+        super().__init__(
+            num_buffers=num_buffers, 
+            action_repeat=action_repeat, 
+            actor_history=actor_history, 
+            episode_length=episode_length
+        )
 
         ctrl_range = self.env.mj_model.actuator_ctrlrange
         self.action_lower = jnp.asarray(ctrl_range[:, 0])
@@ -102,7 +110,7 @@ class DmControlEnvironment(MuJoCoSimulationEnvironment):
         config.action_repeat = 1
 
         return suite.load(self.env_name, config=config)
-
+        
     def _setup_observation(self):
 
         if isinstance(self.camera, str):
@@ -138,14 +146,15 @@ class DmControlEnvironment(MuJoCoSimulationEnvironment):
         # keep render_context alive and pass only its lightweight pytree handle through compiled computations.
         self.render_context_pytree = self.render_context.pytree()
 
-    def _state(self, state) -> Array:
-        return jnp.concatenate([state.data.qpos, state.data.qvel], axis=-1)
-
     def _observe(self, state):
         data = mjx.refit_bvh(self.env.mjx_model, state.data, self.render_context_pytree)
         packed_rgb, _, data = mjx.render(self.env.mjx_model, data, self.render_context_pytree)
         observation = mjx.get_rgb(self.render_context_pytree, self.camera_id, packed_rgb)
         observation = observation[..., :3].astype(jnp.float32)      # MJX is already returning images in [0,1] so no need to divide / 255.0 
+
+        if not self.rgb:
+            weights = jnp.asarray([0.2989, 0.5870, 0.1140])
+            observation = jnp.sum(observation * weights, axis=-1, keepdims=True)
 
         state = state.replace(data=data) # , obs=observation)
         return state, observation
@@ -161,13 +170,15 @@ if __name__ == "__main__":
         domain_name="cheetah",
         task_name="run",
         num_buffers=32,
+        actor_history=1,
         width=64,
         height=64,
     )
 
-    state = env.initial_state(jax.random.key(0), 32)
-    state, observation = jax.jit(env._observe)(state)
+    carry = jax.jit(lambda key: env.initial_carry(key, 32))(jax.random.key(0))
+    observation = env.current_observation(carry)
 
     print(observation.shape)
     print(observation.dtype)
     print(observation.min(), observation.max())
+

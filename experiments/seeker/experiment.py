@@ -7,6 +7,7 @@ import pickle
 import argparse
 
 import numpy as np
+import jax.numpy as jnp
 import jax.random as jr
 
 from rp_slac.training import RPSLAC
@@ -20,6 +21,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--N", dest="N", type=int, default=4)
 parser.add_argument("--D", dest="D", type=int, default=10)
 parser.add_argument("--T", dest="T", type=int, default=50)
+parser.add_argument("--actor-history", type=int, default=4)
 
 parser.add_argument("--stabilise", dest="stabilise", default="clip")
 parser.add_argument("--gamma", dest="gamma", type=float, default=0.99)
@@ -38,10 +40,11 @@ args = parser.parse_args()
 
 
 # SETUP
-ENV = CentreSeekingEnvironment(T=args.T)
+ENV = CentreSeekingEnvironment(T=args.T, actor_history=args.actor_history)
 CONFIG, MODEL_FE, CONTROL_FE = setup(
     sequence_length=args.T,
     latent_dim=args.D,
+    actor_history=args.actor_history,
     env_dim=1,
     batch_size=args.batch_size, 
     num_buffers=args.N,
@@ -111,6 +114,9 @@ def get_action_grid(trainer: RPSLAC):
     grid = ENV.grid(num_positions=101, num_velocities=101)
     grid_shape = grid.shape[:-1]
     observations = grid.reshape((-1, grid.shape[-1]))
+
+    # evaluate each grid point using a stationary observation history
+    observations = jnp.tile(observations, (1, args.actor_history))
 
     # get action grid
     actions = trainer.apply(key, trainer.params, observations, deterministic=True)
