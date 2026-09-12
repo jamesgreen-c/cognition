@@ -95,8 +95,9 @@ class Actor:
         action = self.action_bias + self.action_scale * squashed_action
 
         # calculate log pi(a_t | s_t) and jacobian for tanh squash
+        log_det = 2.0 * (jnp.log(2.0) - raw_action - jax.nn.softplus(-2.0 * raw_action))   # jnp.log(1.0 - squashed_action ** 2 + 1e-6)
         log_prob = dist.log_prob(raw_action)
-        log_prob -= jnp.sum(jnp.log(self.action_scale) + jnp.log(1.0 - squashed_action ** 2 + 1e-6))
+        log_prob -= jnp.sum(jnp.log(self.action_scale) + log_det)
 
         return action, log_prob
 
