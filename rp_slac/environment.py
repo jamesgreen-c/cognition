@@ -10,17 +10,21 @@ from jax.tree_util import tree_map
 
 
 class JAXCarry(NamedTuple):
-    """Batched state and its current observation."""
+    """Batched state and oldest-to-newest observation history."""
 
     state: Any
-    observation: Array
+    observations: Array
 
 
 class JAXEnvironment(ABC):
     """Base class for lightweight, fully JAX-native environments."""
 
     jax_compatible = True
-    actor_history = 1
+
+    def __init__(self, actor_history: int = 1):
+        if actor_history < 1:
+            raise ValueError("actor_history must be positive.")
+        self.actor_history = actor_history
 
     def initial_carry(self, key: PRNGKey, num_samples: int) -> JAXCarry:
         """Initialise ``num_samples`` independent environments."""
@@ -30,7 +34,8 @@ class JAXEnvironment(ABC):
         state_key, observation_key = jr.split(key)
         states = vmap(self.initial_state)(jr.split(state_key, num_samples))
         observations = vmap(self.observe)(jr.split(observation_key, num_samples), states)
-        return JAXCarry(state=states, observation=observations)
+        observations = self._initial_actor_observations(observations)
+        return JAXCarry(state=states, observations=observations)
 
     def collect_step(
             self,
@@ -40,16 +45,13 @@ class JAXEnvironment(ABC):
         ) -> tuple[JAXCarry, Array, Array, Array]:
         """Advance every environment by exactly one transition."""
         num_samples = actions.shape[0]
-        if carry.observation.shape[0] != num_samples:
+        if carry.observations.shape[0] != num_samples:
             raise ValueError("The action and environment batches must have the same size.")
 
         model_key, reset_key, observation_key = jr.split(key, 3)
-        next_states, rewards = vmap(self.model)(
-            jr.split(model_key, num_samples),
-            carry.state,
-            actions,
-        )
+        next_states, rewards = vmap(self.model)(jr.split(model_key, num_samples), carry.state, actions)
 
+        # reset state if terminated
         episode_ends = vmap(self.is_terminal_state)(next_states)
         reset_states = vmap(self.initial_state)(jr.split(reset_key, num_samples))
         next_states = tree_map(
@@ -59,19 +61,35 @@ class JAXEnvironment(ABC):
         )
         next_observations = vmap(self.observe)(jr.split(observation_key, num_samples), next_states)
 
+        # roll action history window
+        rolled_observations = self._append_actor_observation(carry.observations, next_observations)
+        reset_observations = self._initial_actor_observations(next_observations)
+        observation_history = self._select(episode_ends, reset_observations, rolled_observations)
+
         flags = 1.0 - episode_ends.astype(jnp.float32)
-        next_carry = JAXCarry(state=next_states, observation=next_observations)
+        next_carry = JAXCarry(state=next_states, observations=observation_history)
         return next_carry, next_observations, rewards, flags
 
-    @staticmethod
-    def actor_observation(carry: JAXCarry) -> Array:
-        """Return the network input used by the online policy."""
-        return carry.observation
+    def actor_observation(self, carry: JAXCarry) -> Array:
+        """Concatenate oldest-to-newest observations along the feature axis."""
+        return self._stack_actor_observations(carry.observations)
 
     @staticmethod
     def current_observation(carry: JAXCarry) -> Array:
         """Return the raw observation stored in replay."""
-        return carry.observation
+        return carry.observations[:, -1]
+
+    def _initial_actor_observations(self, observation: Array) -> Array:
+        return jnp.repeat(observation[:, None], self.actor_history, axis=1)
+
+    @staticmethod
+    def _append_actor_observation(observations: Array, observation: Array) -> Array:
+        return jnp.concatenate((observations[:, 1:], observation[:, None]), axis=1)
+
+    def _stack_actor_observations(self, observations: Array) -> Array:
+        if observations.ndim == 2:
+            return observations
+        return jnp.concatenate([observations[:, i] for i in range(self.actor_history)], axis=-1)
 
     @staticmethod
     def _select(condition: Array, true_value: Array, false_value: Array) -> Array:
