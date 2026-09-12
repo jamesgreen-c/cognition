@@ -44,7 +44,10 @@ class ConstrainedIVFreeEnergy:
         # prior = stopgrad(self.model.prior.update(prior_params))
 
         ### E-step
-        prior_chain, factors_nat, posterior = self.get_posterior(prior, params["rpm"], actions, observations)
+        prior_chain, factors_nat, posterior, filtered_means = self.get_posterior(prior, 
+                                                                                 params["rpm"], 
+                                                                                 actions, 
+                                                                                 observations)
         if em: posterior = stopgrad(posterior)
 
         ### M-step
@@ -55,6 +58,7 @@ class ConstrainedIVFreeEnergy:
 
         aux = {
             'posterior': posterior,
+            'filtered_means': filtered_means,
             'factors_nat': factors_nat,
             'kl_qp': kl_qp / Z,
             'kl_qf': kl_qf / Z,
@@ -68,11 +72,11 @@ class ConstrainedIVFreeEnergy:
         factors_tot = AllParam(factors_nat.sum(axis=0))                                    # BxTxK
 
         prior_chains = vmap(lambda _acts: prior.to_chain(_acts))(actions)                  # TxK
-        posterior = vmap(
+        posterior, filtered_means = vmap(
             lambda f, _acts: parallel_smoother(prior, f, _acts, self.model.latent_dim)
         )(factors_tot.dist_param, actions)                                                 # BxTxK
 
-        return prior_chains, factors_nat, posterior
+        return prior_chains, factors_nat, posterior, filtered_means
         #TODO: implement flexible_vmap function for factors
 
     def get_loss_terms(self, prior_chains, factors_nat, posterior):
@@ -97,6 +101,8 @@ class ConstrainedIVFreeEnergy:
 
 def parallel_smoother(prior, factors, actions, latent_dim):
 
+    A = prior.params['A'] 
+    Q = prior.params['Q']
     C = jnp.eye(latent_dim)
     d = jnp.zeros(latent_dim) # TODO: check if C,d are automatically initialized to these values
     dynamics_bias = actions @ prior.params['B'].T + prior.params['b']
@@ -119,7 +125,7 @@ def parallel_smoother(prior, factors, actions, latent_dim):
     
     filtered_cov = smoother_out['filtered_covariances']
     smoothed_cov = smoother_out['smoothed_covariances']
-    A, Q = prior.params['A'], prior.params['Q']
+
     cross_covs = vmap(
         lambda S, F: inv_quad_form(Q + A @ F @ A.T, S.T, A @ F)
     )(smoothed_cov[1:], filtered_cov[:-1])
@@ -129,4 +135,4 @@ def parallel_smoother(prior, factors, actions, latent_dim):
         covs=smoothed_cov,
         cross_covs=cross_covs
     )
-    return posterior
+    return posterior, smoother_out["filtered_means"]
