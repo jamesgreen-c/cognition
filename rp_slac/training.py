@@ -5,12 +5,11 @@ import jax.random as jr
 import jax.numpy as jnp
 
 from tqdm import tqdm
-from typing import Callable, Union
+from typing import Callable
 
 from jax import Array, vmap
 from jax.random import PRNGKey
 from jax.tree_util import tree_map
-from jax.lax import stop_gradient as stopgrad
 
 from rp_slac.environment import JAXEnvironment, MuJoCoSimulationEnvironment
 from rp_slac.free_energy.model_fe import ConstrainedIVFreeEnergy
@@ -34,7 +33,7 @@ class RPSLAC:
             self,
             model: ConstrainedIVFreeEnergy,
             control: ControlFreeEnergy, 
-            environment: Union[JAXEnvironment, MuJoCoSimulationEnvironment],
+            environment: JAXEnvironment | MuJoCoSimulationEnvironment,
             config: Config,
             logger: Callable = lambda *x: {}
     ):
@@ -42,87 +41,23 @@ class RPSLAC:
         self.model = model
         self.control = control
         self.env = environment
-
         self.config = config
         self.logger = logger
-
         self.itr = 0
 
         assert self.config.actor_state in ("observation", "latent")
 
+        if (self.config.actor_state == "observation" and self.config.actor_history != self.env.actor_history):
+            raise ValueError(
+                "config.actor_history must match environment.actor_history "
+                f"({self.config.actor_history} != {self.env.actor_history})."
+            )
+        if self.config.initial_steps < 1:
+            raise ValueError("initial_steps must be positive.")
         if self.config.initial_steps < self.config.sequence_length:
             raise ValueError("initial_steps must be at least sequence_length.")
-
         if self.config.initial_steps > self.config.capacity:
             raise ValueError("initial_steps cannot exceed replay capacity.")
-
-        if self.config.collection_steps > self.config.capacity:
-            raise ValueError("collection_steps cannot exceed replay capacity.")
-
-
-    def experience_step(
-            self,
-            key: PRNGKey,
-            params: dict,
-            env_states: Array,
-            replay_buffer: dict,
-        ):
-        K = self.config.collection_steps
-        C = self.config.capacity
-        M = self.config.num_buffers
-        size = replay_buffer["size"]
-
-        def policy(_key, _observation):
-            _observation = self.env.preprocess_observation(_observation)
-            return self.control.policy(_key, params, _observation)
-
-        env_states, _, new_obs, new_act, new_rew, new_flags, new_log_ps = self.env.sample(
-            key=key,
-            policy=policy,
-            num_samples=M,
-            num_steps=K,
-            state_0=env_states,
-        )
-        
-        obs, act, rew, flags, log_ps = replay_buffer["data"]
-
-        def append_to_available_space(_):
-            updated_obs = jax.lax.dynamic_update_slice_in_dim(obs, new_obs[:, 1:], size + 1, axis=1)
-            updated_act = jax.lax.dynamic_update_slice_in_dim(act, new_act, size, axis=1)
-            updated_rew = jax.lax.dynamic_update_slice_in_dim(rew, new_rew, size, axis=1)
-            updated_flags = jax.lax.dynamic_update_slice_in_dim(flags, new_flags, size, axis=1)
-            updated_log_ps = jax.lax.dynamic_update_slice_in_dim(log_ps, new_log_ps, size, axis=1)
-            return (updated_obs, updated_act, updated_rew, updated_flags, updated_log_ps, size + K)
-
-        def append_at_capacity(_):
-            keep = C - K
-            start = size - keep
-
-            kept_obs = jax.lax.dynamic_slice_in_dim(obs, start, keep + 1, axis=1)
-            kept_act = jax.lax.dynamic_slice_in_dim(act, start, keep, axis=1)
-            kept_rew = jax.lax.dynamic_slice_in_dim(rew, start, keep, axis=1)
-            kept_flags = jax.lax.dynamic_slice_in_dim(flags, start, keep, axis=1)
-            kept_log_ps = jax.lax.dynamic_slice_in_dim(log_ps, start, keep, axis=1)
-
-            return (
-                jnp.concatenate((kept_obs, new_obs[:, 1:]), axis=1),
-                jnp.concatenate((kept_act, new_act), axis=1),
-                jnp.concatenate((kept_rew, new_rew), axis=1),
-                jnp.concatenate((kept_flags, new_flags), axis=1),
-                jnp.concatenate((kept_log_ps, new_log_ps), axis=1),
-                jnp.asarray(C, dtype=jnp.int32),
-            )
-
-        obs, act, rew, flags, log_ps, size = jax.lax.cond(
-            size + K <= C,
-            append_to_available_space,
-            append_at_capacity,
-            operand=None,
-        )
-
-        replay_buffer = {"data": (obs, act, rew, flags, log_ps), "size": size}
-        return replay_buffer, env_states
-    
 
     def pretrain_step(self, itr: int, params: AllParams, opt_states: dict[optax.OptState], data: tuple[Array]):
             model_params, model_opt_states, model_loss, _ = self._update_model(itr, params, opt_states, data)
@@ -130,7 +65,6 @@ class RPSLAC:
             new_opt_states = {**opt_states, **model_opt_states}
             return new_params, new_opt_states, model_loss
 
-    
     def train_step(
             self,
             key: PRNGKey,
@@ -139,15 +73,18 @@ class RPSLAC:
             opt_states: dict[optax.OptState],
             data: tuple[Array],
     ) -> tuple[dict, dict[optax.OptState], dict[float]]: 
-        sample_key, actor_key, critic_key = jr.split(key, 3)
+        actor_key, critic_key = jr.split(key)
 
         # calculate all updates from the previous step parameters
-        model_params, model_opt_states, model_loss, posterior = self._update_model(itr, params, opt_states, data)
-        latents = posterior.sample(sample_key)    # latents = posterior.params["means"]
+        model_params, model_opt_states, model_loss, filtered_means = self._update_model(itr, 
+                                                                                          params, 
+                                                                                          opt_states, 
+                                                                                          data)
+        latents = filtered_means   # TODO: posterior.sample(sampling_key)
 
         critic_params, critic_opt_state, critic_loss = self._update_critic(critic_key, params, opt_states, latents, data)
         actor_params, actor_opt_state, actor_loss, aux = self._update_actor(actor_key, params, opt_states, latents, data)
-        log_alpha, alpha_opt_state, alpha_loss = self._update_alpha(params, opt_states, data)
+        log_alpha, alpha_opt_state, alpha_loss, entropy_gap = self._update_alpha(params, opt_states, aux["log_probs"])
 
         # combine the independently updated parameter subsets
         new_params = {
@@ -165,6 +102,7 @@ class RPSLAC:
             "alpha": alpha_opt_state
         }
 
+        aux = {**aux, "entropy_gap": entropy_gap}
         losses = {"model": model_loss, "critic": critic_loss, "actor": actor_loss, "alpha": alpha_loss}
         return new_params, new_opt_states, losses, aux
     
@@ -178,15 +116,14 @@ class RPSLAC:
         """
         key, buffer_key, init_key = jr.split(jr.PRNGKey(self.config.seed), 3)
 
-        replay_buffer, env_states = self._init_replay_buffer(buffer_key)
+        replay_buffer, env_states = self._init_replay_buffer(buffer_key, use_pbar)
         self.params, self.opt_states, self.opts = self.init(init_key, replay_buffer["data"])
 
-        # experience_step = jax.jit(self.experience_step) if self.config.jit else self.experience_step
-        experience_step = (
-            jax.jit(self.experience_step)
-            if self.config.jit and self.env.jax_compatible
-            else self.experience_step
-        )
+        # JIT compile (or don't) policy, experience, pretraining and training functions 
+        compile_environment = self.config.jit and self.env.jax_compatible
+        policy_step = jax.jit(self.policy_step) if compile_environment else self.policy_step
+        collect_step = jax.jit(self.env.collect_step) if compile_environment else self.env.collect_step
+        append_experience = jax.jit(self._append_experience) if compile_environment else self._append_experience
         pretrain_step = jax.jit(self.pretrain_step) if self.config.jit else self.pretrain_step
         train_step = jax.jit(self.train_step) if self.config.jit else self.train_step
 
@@ -216,9 +153,12 @@ class RPSLAC:
 
         pbar = tqdm(range(self.config.num_iter), disable=not(use_pbar), desc="Training")
         for self.itr in pbar:
-            key, collection_key, batch_key, train_key = jr.split(key, 4)
+            key, policy_key, env_key, batch_key, train_key = jr.split(key, 5)
 
-            replay_buffer, env_states = experience_step(collection_key, self.params, env_states, replay_buffer)
+            actor_observation = self.env.actor_observation(env_states)
+            actions, log_probs = policy_step(policy_key, self.params["actor"], actor_observation)
+            env_states, new_obs, rewards, flags = collect_step(env_key, env_states, actions)
+            replay_buffer = append_experience(replay_buffer, new_obs, actions, rewards, flags, log_probs)
             batch = self._get_batch(batch_key, replay_buffer)
 
             self.params, self.opt_states, losses, aux = train_step(train_key, 
@@ -251,7 +191,6 @@ class RPSLAC:
 
         return self.params, replay_buffer
     
-        
     def init(self, key: PRNGKey, replay_buffer: tuple[Array]):
         """ initialise all agent parameters """
         model_key, control_key = jr.split(key)
@@ -277,42 +216,58 @@ class RPSLAC:
 
         return params, opt_states, opts
     
-    def _init_replay_buffer(self, key: PRNGKey):
+    def _init_replay_buffer(self, key: PRNGKey, use_pbar: bool):
         N = self.config.num_buffers
         I = self.config.initial_steps
         C = self.config.capacity
 
-        env_states, _, observations, actions, rewards, flags, log_probs = self.env.sample(
-            key=key,
-            policy=self.env.random_action,
-            num_samples=N,
-            num_steps=I,
+        # compile required functions
+        compile_environment = self.config.jit and self.env.jax_compatible
+        random_policy_step = jax.jit(self.random_policy_step) if compile_environment else self.random_policy_step
+        collect_step = jax.jit(self.env.collect_step) if compile_environment else self.env.collect_step
+        append_experience = jax.jit(self._append_experience) if compile_environment else self._append_experience
+        initial_carry = (
+            jax.jit(lambda init_key: self.env.initial_carry(init_key, N))
+            if compile_environment
+            else lambda init_key: self.env.initial_carry(init_key, N)
         )
 
-        # initialise buffers with full capacity
-        observation_buffer = jnp.zeros((N, C + 1) + observations.shape[2:], dtype=observations.dtype)
-        action_buffer = jnp.zeros((N, C) + actions.shape[2:], dtype=actions.dtype)
+        key, initial_key = jr.split(key)
+        env_states = initial_carry(initial_key)
+        initial_observation = self.env.current_observation(env_states)
+
+        # Get shapes and dtypes from a single transition step
+        key, policy_key, env_key = jr.split(key, 3)
+        actions, log_probs = random_policy_step(policy_key, initial_observation)
+        env_states, next_observation, rewards, flags = collect_step(
+            env_key,
+            env_states,
+            actions,
+        )
+
+        # initialise buffer
+        observation_buffer = jnp.zeros((N, C + 1) + initial_observation.shape[1:]).at[:, 0].set(initial_observation)
+        action_buffer = jnp.zeros((N, C) + actions.shape[1:], dtype=actions.dtype)
         reward_buffer = jnp.zeros((N, C), dtype=rewards.dtype)
         flag_buffer = jnp.zeros((N, C), dtype=flags.dtype)
         log_prob_buffer = jnp.zeros((N, C), dtype=log_probs.dtype)
 
-        # store initial experience
-        observation_buffer = observation_buffer.at[:, :I + 1].set(observations)
-        action_buffer = action_buffer.at[:, :I].set(actions)
-        reward_buffer = reward_buffer.at[:, :I].set(rewards)
-        flag_buffer = flag_buffer.at[:, :I].set(flags)
-        log_prob_buffer = log_prob_buffer.at[:, :I].set(log_probs)
-
         replay_buffer = {
-            "data": (
-                observation_buffer,
-                action_buffer,
-                reward_buffer,
-                flag_buffer,
-                log_prob_buffer,
-            ),
-            "size": jnp.asarray(I, dtype=jnp.int32),
+            "data": (observation_buffer, action_buffer, reward_buffer, flag_buffer, log_prob_buffer),
+            "size": jnp.asarray(0, dtype=jnp.int32),
         }
+        replay_buffer = append_experience(replay_buffer, next_observation, actions, rewards, flags, log_probs)
+
+        # run random experience collection
+        pbar = tqdm(range(1, I), disable=not(use_pbar), desc="Getting random experience")
+        for _ in pbar:
+            key, policy_key, env_key = jr.split(key, 3)
+            observation = self.env.current_observation(env_states)
+            actions, log_probs = random_policy_step(policy_key, observation)
+            env_states, next_observation, rewards, flags = collect_step(env_key, env_states, actions)
+            replay_buffer = append_experience(replay_buffer, next_observation, actions, rewards, flags, log_probs)
+
+        jax.block_until_ready(replay_buffer["size"])
         return replay_buffer, env_states
 
     def _get_batch(self, key: PRNGKey, replay_buffer: tuple[Array]):
@@ -339,6 +294,7 @@ class RPSLAC:
         keys = jr.split(key, N)
 
         def sample_buffer(key, obs, act, rew, disc, log_ps):
+
             # number of terminal transitions in every length-tau window
             terminals = 1.0 - disc
             cumulative = jnp.concatenate([jnp.zeros((1,), dtype=terminals.dtype), jnp.cumsum(terminals)])
@@ -373,6 +329,52 @@ class RPSLAC:
 
         return (observations, actions, rewards, discounts, log_probs)
 
+    def _append_experience(
+            self,
+            replay_buffer: dict,
+            new_obs: Array,
+            new_act: Array,
+            new_rew: Array,
+            new_flags: Array,
+            new_log_ps: Array,
+        ):
+        C = self.config.capacity
+        size = replay_buffer["size"]
+        obs, act, rew, flags, log_ps = replay_buffer["data"]
+
+        new_obs = new_obs[:, None]
+        new_act = new_act[:, None]
+        new_rew = new_rew[:, None]
+        new_flags = new_flags[:, None]
+        new_log_ps = new_log_ps[:, None]
+
+        def append_to_available_space(_):
+            updated_obs = jax.lax.dynamic_update_slice_in_dim(obs, new_obs, size + 1, axis=1)
+            updated_act = jax.lax.dynamic_update_slice_in_dim(act, new_act, size, axis=1)
+            updated_rew = jax.lax.dynamic_update_slice_in_dim(rew, new_rew, size, axis=1)
+            updated_flags = jax.lax.dynamic_update_slice_in_dim(flags, new_flags, size, axis=1)
+            updated_log_ps = jax.lax.dynamic_update_slice_in_dim(log_ps, new_log_ps, size, axis=1)
+            return updated_obs, updated_act, updated_rew, updated_flags, updated_log_ps, size + 1
+
+        def append_at_capacity(_):
+            return (
+                jnp.concatenate((obs[:, 1:], new_obs), axis=1),
+                jnp.concatenate((act[:, 1:], new_act), axis=1),
+                jnp.concatenate((rew[:, 1:], new_rew), axis=1),
+                jnp.concatenate((flags[:, 1:], new_flags), axis=1),
+                jnp.concatenate((log_ps[:, 1:], new_log_ps), axis=1),
+                jnp.asarray(C, dtype=jnp.int32),
+            )
+
+        obs, act, rew, flags, log_ps, size = jax.lax.cond(
+            size < C,
+            append_to_available_space,
+            append_at_capacity,
+            operand=None,
+        )
+        return {"data": (obs, act, rew, flags, log_ps), "size": size}
+
+
     def _update_model(self, itr: int, params, opt_states, data):
         """ Update RPM model parameters using Kalman smoothing """
 
@@ -388,14 +390,9 @@ class RPSLAC:
         new_params = {}
         new_opt_states = {}
         for name in ("prior", "rpm"):
-            updates, new_opt_states[name] = self.opts[name].update(
-                grads[name],
-                opt_states[name],
-                params[name]
-            )
+            updates, new_opt_states[name] = self.opts[name].update(grads[name], opt_states[name], params[name])
             new_params[name] = optax.apply_updates(params[name], updates)
-
-        return new_params, new_opt_states, loss, aux["posterior"]
+        return new_params, new_opt_states, loss, aux["filtered_means"]
 
 
     def _update_critic(self, key, params, opt_states, latents, data):
@@ -428,21 +425,17 @@ class RPSLAC:
 
         updates, new_actor_opt_states = self.opts["actor"].update(grads["actor"], opt_states["actor"], params["actor"])
         actor_params = optax.apply_updates(params["actor"], updates)
-
         return actor_params, new_actor_opt_states, loss, aux
 
 
-    def _update_alpha(self, params, opt_states, data: tuple[Array]):
+    def _update_alpha(self, params, opt_states, log_probs: Array):
         """ Update log temperature parameter """
         _params = {"log_alpha": params["log_alpha"]}
-        loss, grads = jax.value_and_grad(self.control.alpha_loss)(_params, data)
+        (loss, aux), grads = jax.value_and_grad(self.control.alpha_loss, has_aux=True)(_params, log_probs)
 
-        updates, alpha_opt_state = self.opts["alpha"].update(grads["log_alpha"], 
-                                                             opt_states["alpha"], 
-                                                             params["log_alpha"])
-
+        updates, alpha_opt_state = self.opts["alpha"].update(grads["log_alpha"], opt_states["alpha"], params["log_alpha"])
         log_alpha = optax.apply_updates(params["log_alpha"], updates)
-        return log_alpha, alpha_opt_state, loss
+        return log_alpha, alpha_opt_state, loss, aux["entropy_gap"]
     
 
     def _stabilise_params(self):
@@ -474,169 +467,12 @@ class RPSLAC:
         keys = jr.split(key, observations.shape[0])
         return vmap(lambda _key, state: self.control.policy(_key, params, state))(keys, observations)
 
+    def policy_step(self, key: PRNGKey, actor_params: dict, actor_observation: Array):
+        actor_observation = self.env.preprocess_observation(actor_observation)
+        keys = jr.split(key, self.config.num_buffers)
+        return self.control.vmapped_actor(keys, actor_params, actor_observation)
 
-
-########### OLD SEQUENTIAL UPDATES #############
-
-    # def pretrain_step(self, itr: int, params: AllParams, opt_states: dict[optax.OptState], data: tuple[Array]):
-    #     new_params, new_opt_states, model_loss, _ = self._update_model(itr, params, opt_states, data)
-    #     return new_params, new_opt_states, model_loss
-
-
-    # def train_step(
-    #         self,
-    #         key: PRNGKey,
-    #         itr: int,
-    #         params: AllParams,
-    #         opt_states: dict[optax.OptState],
-    #         data: tuple[Array]
-    # ) -> tuple[dict, dict[optax.OptState], dict[float]]: 
-    #     sample_key, actor_key, critic_key = jr.split(key, 3)
-
-    #     # run model updates and sample latents
-    #     params, opt_states, model_loss, posterior = self._update_model(itr, params, opt_states, data)
-    #     # latents = posterior.params["means"]
-    #     latents = posterior.sample(sample_key)
-
-    #     # run soft actor-critic updates
-    #     params, opt_states, critic_loss = self._update_critic(critic_key, params, opt_states, latents, data)
-    #     params, opt_states, actor_loss, aux = self._update_actor(actor_key, params, opt_states, latents, data)
-    #     params, opt_states, alpha_loss = self._update_alpha(params, opt_states, data)
-
-    #     losses = {"model": model_loss, "critic": critic_loss, "actor": actor_loss, "alpha": alpha_loss}
-    #     return params, opt_states, losses, aux
-
-
-
-    # def _update_model(self, itr: int, params, opt_states, data):
-    #     """ Update RPM model parameters using Kalman smoothing """
-
-    #     beta = self.config.beta_schedule(itr)
-    #     em = self.config.em
-
-    #     obs = data[0]
-    #     actions = data[1]
-
-    #     _params = {"prior": params["prior"], "rpm": params["rpm"]}
-    #     (loss, aux), grads = jax.value_and_grad(self.model.loss, has_aux=True)(_params, obs, actions, beta, em)
-
-    #     new_params = {}
-    #     new_opt_states = {}
-    #     for name in ("prior", "rpm"):
-    #         updates, new_opt_states[name] = self.opts[name].update(
-    #             grads[name],
-    #             opt_states[name],
-    #             params[name]
-    #         )
-    #         new_params[name] = optax.apply_updates(params[name], updates)
-
-    #     # return updated params and opt_states
-    #     new_params = {**params, **new_params}
-    #     new_opt_states = {**opt_states, **new_opt_states}
-    #     return new_params, new_opt_states, loss, aux["posterior"]
-
-
-    # def _update_critic(self, key, params, opt_states, latents, data):
-    #     """ Update soft critic parameters """
-    #     rho = self.config.target_update_rate
-    #     _params = {"actor": params["actor"], "critic": params["critic"], "log_alpha": params["log_alpha"]}
-
-    #     # latest param updates
-    #     loss, grads = jax.value_and_grad(self.control.critic_loss, argnums=1)(key, _params, latents, data)
-    #     latest_updates, new_critic_opt_states = self.opts["critic"].update(grads["critic"]["latest"], 
-    #                                                                        opt_states["critic"], 
-    #                                                                        params["critic"]["latest"])
-    #     latest_params = optax.apply_updates(params["critic"]["latest"], latest_updates)
-
-    #     # target param updates
-    #     target_update = lambda _tps, _lps: (1.0 - rho) * _tps + rho * _lps
-    #     target_params = tree_map(target_update, params["critic"]["target"], latest_params)
-
-    #     # return updated params and opt_states
-    #     critic_params = {"latest": latest_params, "target": target_params}
-    #     new_params = {**params, "critic": critic_params}
-    #     new_opt_states = {**opt_states, "critic": new_critic_opt_states}
-    #     return new_params, new_opt_states, loss
-
-
-    # def _update_actor(self, key, params, opt_states, latents, data):
-    #     """ Update soft actor parameters """
-
-    #     _params = {"actor": params["actor"], "critic": params["critic"], "log_alpha": params["log_alpha"]}
-    #     (loss, aux), grads = jax.value_and_grad(
-    #         self.control.actor_loss, argnums=1, has_aux=True
-    #     )(key, _params, latents, data)
-
-    #     updates, new_actor_opt_states = self.opts["actor"].update(grads["actor"], opt_states["actor"], params["actor"])
-    #     actor_params = optax.apply_updates(params["actor"], updates)
-
-    #     new_params = {**params, "actor": actor_params}
-    #     new_opt_states = {**opt_states, "actor": new_actor_opt_states}
-    #     return new_params, new_opt_states, loss, aux
-
-
-    # def _update_alpha(self, params, opt_states, data: tuple[Array]):
-    #     """ Update log temperature parameter """
-    #     _params = {"log_alpha": params["log_alpha"]}
-    #     loss, grads = jax.value_and_grad(self.control.alpha_loss)(_params, data)
-
-    #     updates, alpha_opt_state = self.opts["alpha"].update(grads["log_alpha"], 
-    #                                                          opt_states["alpha"], 
-    #                                                          params["log_alpha"])
-
-    #     log_alpha = optax.apply_updates(params["log_alpha"], updates)
-    #     new_params = {**params,"log_alpha": log_alpha}
-    #     new_opt_states = {**opt_states, "alpha": alpha_opt_state}
-    #     return new_params, new_opt_states, loss
-
-
-
- # def train_continue(self, data: tuple[Array], new_iter: int, key: Array, y: Array = None):
-    #     train_step = jax.jit(self.train_step) if self.config.jit else self.train_step
-
-    #     pbar = tqdm(range(self.itr, self.itr + new_iter))
-    #     for self.itr in pbar:
-    #         key, subkey = jr.split(key)
-    #         batch_indices = jr.randint(subkey, (self.config.batch_size,), 0, data[0].shape[0])
-    #         data_batch = [d[batch_indices] for d in data]
-
-    #         loss, aux, self.params, self.opt_states = train_step(
-    #             self.params, self.opt_states, data_batch
-    #         )
-            
-    #         self._stabilise_params()
-
-    #         self.loss_tot.append(loss)
-    #         to_print = self.logger(self, aux, batch_indices) # TODO: validation step?
-    #         to_print.update({'loss': f'{loss:.3f}'})
-
-    #         pbar.set_postfix(**to_print)
-
-    #         if y is not None and self.itr % 100 == 0:
-    #             x = self.apply((data[0], ))[1].params["means"]
-    #             r2 = linear_r2(x, y)
-    #             self.r2_history.append(r2)
-
-
-
-        # if K > 1:
-
-        #     def _body():
-        #         pass
-        #     # only lax scan if more than one step 
-
-        # # otherwise just do one update
-
-
-        # # update target as
-        # target_params_1 = self.params["critic"]["target"]["one"]
-        # target_params_2 = self.params["critic"]["target"]["two"]
-
-        # latest_params_1 = self.params["latest"]["target"]["one"]
-        # latest_params_2 = self.params["latest"]["target"]["two"]
-
-        # tar_params_1 = (1 - rho) * tar_params_1 + rho * latest_params_1
-        # tar_params_2 = (1 - rho) * tar_params_2 + rho * latest_params_2
-
-        # params["critic"]["target"] = {"one": tar_params_1, "two": tar_params_2}
-        # return params
+    def random_policy_step(self, key: PRNGKey, observation: Array):
+        """Sample one independent random action for each replay buffer."""
+        keys = jr.split(key, self.config.num_buffers)
+        return vmap(self.env.random_action)(keys, observation)

@@ -46,16 +46,27 @@ class ControlFreeEnergy:
         data: tuple[(B, T, ...)]
         """
         action_dim = data[1].shape[-1]
+        actor_key, critic_key = jr.split(key)
 
+        self.actor_history = config.actor_history
         self.batch_size = config.batch_size
         self.num_buffers = config.num_buffers
         self.gamma = config.gamma
         self.actor_state = config.actor_state
         self.target_entropy = -float(action_dim) if config.target_entropy is None else config.target_entropy
 
+        if config.sequence_length + 1 < self.actor_history:
+            raise ValueError("sequence_length + 1 must be at least actor_history.")
+
+        if self.actor_state == "observation": 
+            frames = data[0][0:1, :self.actor_history]
+            actor_example = self._stack_frames(frames)[0]
+        else:
+            actor_example = data[0][0, 0]
+        
         params = {}
-        params["actor"] = self.actor.init(key, data[0][0, 0])                           # applied to first observation
-        params["critic"] = self.critic.init(key, jnp.zeros(latent_dim), data[1][0, 0])  # applied to first action
+        params["actor"] = self.actor.init(actor_key, actor_example)                            # applied to first observation
+        params["critic"] = self.critic.init(critic_key, jnp.zeros(latent_dim), data[1][0, 0])  # applied to first action
         params["log_alpha"] = jnp.asarray(config.initial_log_alpha, dtype=jnp.float32)
         
         opts = {
@@ -81,7 +92,8 @@ class ControlFreeEnergy:
         """
         alpha = jnp.exp(stopgrad(params["log_alpha"]))
         latent = stopgrad(latents[:, -1])                                                    # (B, D)
-        actor_state = data[0][:, -1] if self.actor_state == "observation" else latent
+        # actor_state = data[0][:, -1] if self.actor_state == "observation" else latent
+        actor_state = self._stack_frames(data[0][:, -self.actor_history:]) if self.actor_state == "observation" else latent
 
         B = latent.shape[0]
         keys = jr.split(key, B)
@@ -96,7 +108,7 @@ class ControlFreeEnergy:
         terms = (alpha * log_probs) - values                                                 # (B,)
         loss = terms.mean()
 
-        aux = {"mean": means, "std": stds}
+        aux = {"mean": means, "std": stds, "log_probs": log_probs}
         return loss, aux
 
     def critic_loss(self, key: PRNGKey, params: dict, latents: Array, data: tuple[Array]) -> tuple[float, Any]:
@@ -111,7 +123,8 @@ class ControlFreeEnergy:
         alpha = jnp.exp(stopgrad(params["log_alpha"]))
         latent = stopgrad(latents[:, -2])                                                 # (B, D)
         next_latent = stopgrad(latents[:, -1])                                            # (B, D)
-        actor_state = data[0][:, -1] if self.actor_state == "observation" else next_latent
+        # actor_state = data[0][:, -1] if self.actor_state == "observation" else next_latent
+        actor_state = self._stack_frames(data[0][:, -self.actor_history:]) if self.actor_state == "observation" else next_latent
 
         action = data[1][:, -1]                                                           # (B, K)
         reward = data[2][:, -1]                                                           # (B,)
@@ -132,7 +145,7 @@ class ControlFreeEnergy:
 
         return loss
 
-    def alpha_loss(self, params: dict, data: tuple[Array]) -> Array:
+    def alpha_loss(self, params: dict, log_probs: Array) -> Array:
         """
         Parameters 
         ----------
@@ -140,11 +153,11 @@ class ControlFreeEnergy:
         log_probs:  (B,) batch of log probabilities for the actions taken in this training iteration.
         """
         log_alpha = params["log_alpha"]
-        log_probs = data[4][:, -1]
+        # log_probs = data[4][:, -1]
 
         terms = log_alpha * stopgrad(-log_probs - self.target_entropy)
         loss = terms.mean()
-        return loss
+        return loss, {"entropy_gap": -log_probs.mean() - self.target_entropy}
 
     def policy(self, key: PRNGKey, params: dict, state: Array):
         action, log_prob = self.actor.apply(key, params["actor"], state)
@@ -153,5 +166,12 @@ class ControlFreeEnergy:
     def mean_policy(self, params: dict, state: Array):
         mean, _ = self.actor.stats(params["actor"], state)
         return mean
+
+    def _stack_frames(self, frames: Array) -> Array:
+        """
+        frames: (B, F, H, W, C)
+        returns: (B, H, W, F * C)
+        """
+        return jnp.concatenate([frames[:, i] for i in range(self.actor_history)], axis=-1)
 
 

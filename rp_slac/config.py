@@ -55,8 +55,8 @@ class Config:
     num_iter: int = 1000
 
     initial_steps: int = 500
-    collection_steps: int = 1
     capacity: int = 2500
+    actor_history: int = 1
 
     # control
     gamma: float = 0.99
@@ -105,3 +105,4 @@ class Config:
         lr=3e-4,
         max_grad_norm=None,
     ))
+
