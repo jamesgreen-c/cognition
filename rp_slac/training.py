@@ -3,6 +3,7 @@ import optax
 import jax
 import jax.random as jr
 import jax.numpy as jnp
+import numpy as np
 
 from tqdm import tqdm
 from typing import Callable
@@ -73,14 +74,15 @@ class RPSLAC:
             opt_states: dict[optax.OptState],
             data: tuple[Array],
     ) -> tuple[dict, dict[optax.OptState], dict[float]]: 
-        actor_key, critic_key = jr.split(key)
+        actor_key, critic_key, sampling_key = jr.split(key, 3)
 
         # calculate all updates from the previous step parameters
-        model_params, model_opt_states, model_loss, filtered_means = self._update_model(itr, 
-                                                                                          params, 
-                                                                                          opt_states, 
-                                                                                          data)
-        latents = filtered_means   # TODO: posterior.sample(sampling_key)
+        model_params, model_opt_states, model_loss, filter_posterior = self._update_model(itr,
+                                                                                            params,
+                                                                                            opt_states,
+                                                                                            data)
+        # shape = filter_posterior.params["mean"].shape[:-1]
+        latents = filter_posterior.sample(sampling_key, shape=None)   # filter_posterior.mean
 
         critic_params, critic_opt_state, critic_loss = self._update_critic(critic_key, params, opt_states, latents, data)
         actor_params, actor_opt_state, actor_loss, aux = self._update_actor(actor_key, params, opt_states, latents, data)
@@ -117,13 +119,14 @@ class RPSLAC:
         key, buffer_key, init_key = jr.split(jr.PRNGKey(self.config.seed), 3)
 
         replay_buffer, env_states = self._init_replay_buffer(buffer_key, use_pbar)
-        self.params, self.opt_states, self.opts = self.init(init_key, replay_buffer["data"])
+        key, init_batch_key = jr.split(key)
+        init_batch = self._get_batch(init_batch_key, replay_buffer)
+        self.params, self.opt_states, self.opts = self.init(init_key, init_batch)
 
-        # JIT compile (or don't) policy, experience, pretraining and training functions 
+        # The environment and updates can be JIT compiled; the replay buffer stays on the CPU.
         compile_environment = self.config.jit and self.env.jax_compatible
         policy_step = jax.jit(self.policy_step) if compile_environment else self.policy_step
         collect_step = jax.jit(self.env.collect_step) if compile_environment else self.env.collect_step
-        append_experience = jax.jit(self._append_experience) if compile_environment else self._append_experience
         pretrain_step = jax.jit(self.pretrain_step) if self.config.jit else self.pretrain_step
         train_step = jax.jit(self.train_step) if self.config.jit else self.train_step
 
@@ -158,7 +161,7 @@ class RPSLAC:
             actor_observation = self.env.actor_observation(env_states)
             actions, log_probs = policy_step(policy_key, self.params["actor"], actor_observation)
             env_states, new_obs, rewards, flags = collect_step(env_key, env_states, actions)
-            replay_buffer = append_experience(replay_buffer, new_obs, actions, rewards, flags, log_probs)
+            replay_buffer = self._append_experience(replay_buffer, new_obs, actions, rewards, flags, log_probs)
             batch = self._get_batch(batch_key, replay_buffer)
 
             self.params, self.opt_states, losses, aux = train_step(train_key, 
@@ -191,14 +194,14 @@ class RPSLAC:
 
         return self.params, replay_buffer
     
-    def init(self, key: PRNGKey, replay_buffer: tuple[Array]):
+    def init(self, key: PRNGKey, initial_batch: tuple[Array]):
         """ initialise all agent parameters """
         model_key, control_key = jr.split(key)
 
         # control initialisation
         control_params, control_opt_states, control_opts = self.control.init(
             control_key, 
-            replay_buffer,
+            initial_batch,
             self.config,
             self.model.model.latent_dim
         )
@@ -206,7 +209,7 @@ class RPSLAC:
         # add rpm initialisation
         model_params, model_opt_states, model_opts = self.model.init(
             model_key, 
-            replay_buffer, 
+            initial_batch,
             self.config
         )
 
@@ -225,7 +228,6 @@ class RPSLAC:
         compile_environment = self.config.jit and self.env.jax_compatible
         random_policy_step = jax.jit(self.random_policy_step) if compile_environment else self.random_policy_step
         collect_step = jax.jit(self.env.collect_step) if compile_environment else self.env.collect_step
-        append_experience = jax.jit(self._append_experience) if compile_environment else self._append_experience
         initial_carry = (
             jax.jit(lambda init_key: self.env.initial_carry(init_key, N))
             if compile_environment
@@ -236,7 +238,7 @@ class RPSLAC:
         env_states = initial_carry(initial_key)
         initial_observation = self.env.current_observation(env_states)
 
-        # Get shapes and dtypes from a single transition step
+        # get shapes and dtypes from a single transition step
         key, policy_key, env_key = jr.split(key, 3)
         actions, log_probs = random_policy_step(policy_key, initial_observation)
         env_states, next_observation, rewards, flags = collect_step(
@@ -245,18 +247,33 @@ class RPSLAC:
             actions,
         )
 
-        # initialise buffer
-        observation_buffer = jnp.zeros((N, C + 1) + initial_observation.shape[1:]).at[:, 0].set(initial_observation)
-        action_buffer = jnp.zeros((N, C) + actions.shape[1:], dtype=actions.dtype)
-        reward_buffer = jnp.zeros((N, C), dtype=rewards.dtype)
-        flag_buffer = jnp.zeros((N, C), dtype=flags.dtype)
-        log_prob_buffer = jnp.zeros((N, C), dtype=log_probs.dtype)
+        # store image observations as uint8 when the renderer provides floats in [0, 1].
+        initial_observation = np.asarray(jax.device_get(initial_observation))
+        quantize_observations = (
+            initial_observation.ndim >= 4
+            and np.issubdtype(initial_observation.dtype, np.floating)
+            and np.isfinite(initial_observation).all()
+            and initial_observation.min() >= 0.0
+            and initial_observation.max() <= 1.0
+        )
+        if quantize_observations:
+            initial_observation = np.rint(initial_observation * 255.0).astype(np.uint8)
+
+        observation_buffer = np.empty((N, C + 1) + initial_observation.shape[1:], dtype=initial_observation.dtype)
+        observation_buffer[:, 0] = initial_observation
+        action_buffer = np.empty((N, C) + actions.shape[1:], dtype=actions.dtype)
+        reward_buffer = np.empty((N, C), dtype=rewards.dtype)
+        flag_buffer = np.empty((N, C), dtype=flags.dtype)
+        log_prob_buffer = np.empty((N, C), dtype=log_probs.dtype)
 
         replay_buffer = {
             "data": (observation_buffer, action_buffer, reward_buffer, flag_buffer, log_prob_buffer),
-            "size": jnp.asarray(0, dtype=jnp.int32),
+            "size": 0,
+            "write": 0,              # next transition slot
+            "obs_start": 0,          # oldest observation slot
+            "quantized_obs": quantize_observations,
         }
-        replay_buffer = append_experience(replay_buffer, next_observation, actions, rewards, flags, log_probs)
+        replay_buffer = self._append_experience(replay_buffer, next_observation, actions, rewards, flags, log_probs)
 
         # run random experience collection
         pbar = tqdm(range(1, I), disable=not(use_pbar), desc="Getting random experience")
@@ -265,12 +282,11 @@ class RPSLAC:
             observation = self.env.current_observation(env_states)
             actions, log_probs = random_policy_step(policy_key, observation)
             env_states, next_observation, rewards, flags = collect_step(env_key, env_states, actions)
-            replay_buffer = append_experience(replay_buffer, next_observation, actions, rewards, flags, log_probs)
+            replay_buffer = self._append_experience(replay_buffer, next_observation, actions, rewards, flags, log_probs)
 
-        jax.block_until_ready(replay_buffer["size"])
         return replay_buffer, env_states
 
-    def _get_batch(self, key: PRNGKey, replay_buffer: tuple[Array]):
+    def _get_batch(self, key: PRNGKey, replay_buffer: dict):
         """
         Sample B contiguous windows independently from each of N buffers,
         without crossing episode boundaries.
@@ -288,46 +304,44 @@ class RPSLAC:
         N = self.config.num_buffers
         B = self.config.batch_size
         tau = self.config.sequence_length
-        capacity = self.config.capacity
-        num_starts = capacity - tau + 1
+        C = self.config.capacity
 
-        keys = jr.split(key, N)
+        if size < tau:
+            raise ValueError("The replay buffer has fewer transitions than sequence_length.")
 
-        def sample_buffer(key, obs, act, rew, disc, log_ps):
+        # derive the host RNG from the supplied JAX key so batching remains reproducible.
+        rng = np.random.default_rng(np.asarray(jax.device_get(jr.key_data(key))))
+        transition_start = (replay_buffer["write"] - size) % C
+        ordered_indices = (transition_start + np.arange(size)) % C
+        starts = np.empty((N, B), dtype=np.intp)
 
-            # number of terminal transitions in every length-tau window
-            terminals = 1.0 - disc
-            cumulative = jnp.concatenate([jnp.zeros((1,), dtype=terminals.dtype), jnp.cumsum(terminals)])
-            terminal_counts = cumulative[tau:] - cumulative[:-tau]
+        for n in range(N):
+            terminals = discounts[n, ordered_indices] != 1
+            cumulative = np.concatenate((np.zeros(1, dtype=np.int32), np.cumsum(terminals, dtype=np.int32)))
+            valid_starts = np.flatnonzero(cumulative[tau:] == cumulative[:-tau])
 
-            # valid only when the complete window belongs to one episode and we arent an empty buffer region
-            starts = jnp.arange(num_starts)
-            within_filled_buffer = starts + tau <= size
-            within_one_episode = terminal_counts == 0
-            valid_starts = within_filled_buffer & within_one_episode
+            if valid_starts.size == 0:
+                raise ValueError(f"No episode-contiguous replay windows for buffer {n}.")
+            starts[n] = rng.choice(valid_starts, size=B, replace=True)
 
-            # uniform sampling with replacement over valid starts
-            logits = jnp.where(valid_starts, 0.0, -jnp.inf)
-            starts = jr.categorical(key, logits, shape=(B,))
-
-            def sample_window(start):
-                return (
-                    jax.lax.dynamic_slice_in_dim(obs, start, tau + 1, axis=0),
-                    jax.lax.dynamic_slice_in_dim(act, start, tau, axis=0),
-                    jax.lax.dynamic_slice_in_dim(rew, start, tau, axis=0),
-                    jax.lax.dynamic_slice_in_dim(disc, start, tau, axis=0),
-                    jax.lax.dynamic_slice_in_dim(log_ps, start, tau, axis=0)
-                )
-
-            return vmap(sample_window)(starts)
-
-        batch = vmap(sample_buffer)(keys, observations, actions, rewards, discounts, log_probs)
+        buffer_indices = np.arange(N)[:, None, None]
+        transition_indices = (transition_start + starts[..., None] + np.arange(tau)) % C
+        observation_indices = (replay_buffer["obs_start"] + starts[..., None] + np.arange(tau + 1)) % (C + 1)
+        batch = (
+            observations[buffer_indices, observation_indices],
+            actions[buffer_indices, transition_indices],
+            rewards[buffer_indices, transition_indices],
+            discounts[buffer_indices, transition_indices],
+            log_probs[buffer_indices, transition_indices],
+        )
         batch = tuple(x.reshape((N * B,) + x.shape[2:]) for x in batch)
 
-        observations, actions, rewards, discounts, log_probs = batch
+        observations, actions, rewards, discounts, log_probs = (jnp.asarray(x) for x in batch)
+        if replay_buffer["quantized_obs"]:
+            observations = observations.astype(jnp.float32) / 255.0
         observations = self.env.preprocess_observation(observations)
 
-        return (observations, actions, rewards, discounts, log_probs)
+        return observations, actions, rewards, discounts, log_probs
 
     def _append_experience(
             self,
@@ -340,39 +354,28 @@ class RPSLAC:
         ):
         C = self.config.capacity
         size = replay_buffer["size"]
+        write = replay_buffer["write"]
+        obs_start = replay_buffer["obs_start"]
         obs, act, rew, flags, log_ps = replay_buffer["data"]
 
-        new_obs = new_obs[:, None]
-        new_act = new_act[:, None]
-        new_rew = new_rew[:, None]
-        new_flags = new_flags[:, None]
-        new_log_ps = new_log_ps[:, None]
-
-        def append_to_available_space(_):
-            updated_obs = jax.lax.dynamic_update_slice_in_dim(obs, new_obs, size + 1, axis=1)
-            updated_act = jax.lax.dynamic_update_slice_in_dim(act, new_act, size, axis=1)
-            updated_rew = jax.lax.dynamic_update_slice_in_dim(rew, new_rew, size, axis=1)
-            updated_flags = jax.lax.dynamic_update_slice_in_dim(flags, new_flags, size, axis=1)
-            updated_log_ps = jax.lax.dynamic_update_slice_in_dim(log_ps, new_log_ps, size, axis=1)
-            return updated_obs, updated_act, updated_rew, updated_flags, updated_log_ps, size + 1
-
-        def append_at_capacity(_):
-            return (
-                jnp.concatenate((obs[:, 1:], new_obs), axis=1),
-                jnp.concatenate((act[:, 1:], new_act), axis=1),
-                jnp.concatenate((rew[:, 1:], new_rew), axis=1),
-                jnp.concatenate((flags[:, 1:], new_flags), axis=1),
-                jnp.concatenate((log_ps[:, 1:], new_log_ps), axis=1),
-                jnp.asarray(C, dtype=jnp.int32),
-            )
-
-        obs, act, rew, flags, log_ps, size = jax.lax.cond(
-            size < C,
-            append_to_available_space,
-            append_at_capacity,
-            operand=None,
+        new_obs, new_act, new_rew, new_flags, new_log_ps = (
+            np.asarray(x) for x in jax.device_get((new_obs, new_act, new_rew, new_flags, new_log_ps))
         )
-        return {"data": (obs, act, rew, flags, log_ps), "size": size}
+        if replay_buffer["quantized_obs"]:
+            new_obs = np.rint(np.clip(new_obs, 0.0, 1.0) * 255.0).astype(np.uint8)
+
+        act[:, write] = new_act
+        rew[:, write] = new_rew
+        flags[:, write] = new_flags
+        log_ps[:, write] = new_log_ps
+        obs[:, (obs_start + size + 1) % (C + 1)] = new_obs
+
+        if size == C:
+            replay_buffer["obs_start"] = (obs_start + 1) % (C + 1)
+        else:
+            replay_buffer["size"] = size + 1
+        replay_buffer["write"] = (write + 1) % C
+        return replay_buffer
 
 
     def _update_model(self, itr: int, params, opt_states, data):
@@ -392,7 +395,7 @@ class RPSLAC:
         for name in ("prior", "rpm"):
             updates, new_opt_states[name] = self.opts[name].update(grads[name], opt_states[name], params[name])
             new_params[name] = optax.apply_updates(params[name], updates)
-        return new_params, new_opt_states, loss, aux["filtered_means"]
+        return new_params, new_opt_states, loss, aux["filter_posterior"]
 
 
     def _update_critic(self, key, params, opt_states, latents, data):
