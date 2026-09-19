@@ -9,7 +9,7 @@ from jax.lax import stop_gradient as stopgrad
 
 from rp_slac.config import Config
 from rp_slac.utils.math import inv_quad_form
-from rp_slac.distributions import AllParam, LGChainDistParam, AllParams
+from rp_slac.distributions import AllParam, LGChainDistParam, AllParams, GaussianDistParam
 from rp_slac.recognition.rpm import RPSSM
 
 from dynamax.linear_gaussian_ssm import parallel_lgssm_smoother
@@ -44,10 +44,10 @@ class ConstrainedIVFreeEnergy:
         # prior = stopgrad(self.model.prior.update(prior_params))
 
         ### E-step
-        prior_chain, factors_nat, posterior, filtered_means = self.get_posterior(prior, 
-                                                                                 params["rpm"], 
-                                                                                 actions, 
-                                                                                 observations)
+        prior_chain, factors_nat, posterior, filter_posterior = self.get_posterior(prior, 
+                                                                                   params["rpm"], 
+                                                                                   actions, 
+                                                                                   observations)
         if em: posterior = stopgrad(posterior)
 
         ### M-step
@@ -58,7 +58,7 @@ class ConstrainedIVFreeEnergy:
 
         aux = {
             'posterior': posterior,
-            'filtered_means': filtered_means,
+            'filter_posterior': filter_posterior,
             'factors_nat': factors_nat,
             'kl_qp': kl_qp / Z,
             'kl_qf': kl_qf / Z,
@@ -72,12 +72,11 @@ class ConstrainedIVFreeEnergy:
         factors_tot = AllParam(factors_nat.sum(axis=0))                                    # BxTxK
 
         prior_chains = vmap(lambda _acts: prior.to_chain(_acts))(actions)                  # TxK
-        posterior, filtered_means = vmap(
+        posterior, filter_posterior = vmap(
             lambda f, _acts: parallel_smoother(prior, f, _acts, self.model.latent_dim)
         )(factors_tot.dist_param, actions)                                                 # BxTxK
 
-        return prior_chains, factors_nat, posterior, filtered_means
-        #TODO: implement flexible_vmap function for factors
+        return prior_chains, factors_nat, posterior, filter_posterior
 
     def get_loss_terms(self, prior_chains, factors_nat, posterior):
         kl_qp = vmap(lambda qtk, ptk: qtk.kl(ptk))(posterior, prior_chains) # B
@@ -135,4 +134,9 @@ def parallel_smoother(prior, factors, actions, latent_dim):
         covs=smoothed_cov,
         cross_covs=cross_covs
     )
-    return posterior, smoother_out["filtered_means"]
+    filter_posterior = GaussianDistParam(
+        dist_map=None,
+        mean=smoother_out["filtered_means"],
+        cov=filtered_cov
+    )
+    return posterior, filter_posterior #, smoother_out["filtered_means"]
