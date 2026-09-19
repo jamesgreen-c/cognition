@@ -164,7 +164,11 @@ class DmControlEnvironment(MuJoCoSimulationEnvironment):
 
 
 if __name__ == "__main__":
+    from pathlib import Path
+
     import jax
+    import numpy as np
+    from PIL import Image
 
     env = DmControlEnvironment(
         domain_name="cheetah",
@@ -176,9 +180,56 @@ if __name__ == "__main__":
     )
 
     carry = jax.jit(lambda key: env.initial_carry(key, 32))(jax.random.key(0))
-    observation = env.current_observation(carry)
+    observation = np.asarray(env.current_observation(carry))
 
-    print(observation.shape)
-    print(observation.dtype)
+    print(observation.shape, observation.dtype)
     print(observation.min(), observation.max())
+
+    # Accept (batch, height, width, channels) or (batch, history, height, width, channels).
+    if observation.ndim == 4:
+        observation = observation[:, None]
+    if observation.ndim != 5 or observation.shape[-1] not in (1, 3):
+        raise ValueError(f"Unexpected observation shape: {observation.shape}")
+
+    output_dir = Path("images")
+    output_dir.mkdir(exist_ok=True)
+
+    images = []
+    for buffer_idx, history in enumerate(observation):
+        for history_idx, frame in enumerate(history):
+            pixels = np.uint8(np.round(np.clip(frame, 0.0, 1.0) * 255))
+            if pixels.shape[-1] == 1:
+                pixels = pixels[..., 0]
+
+            image = Image.fromarray(pixels)
+            image.save(output_dir / f"buffer_{buffer_idx:02d}_history_{history_idx:02d}.png")
+            images.append(image.convert("RGB"))
+
+    columns = 8
+    rows = (len(images) + columns - 1) // columns
+    sheet = Image.new("RGB", (columns * env.width, rows * env.height))
+    for idx, image in enumerate(images):
+        sheet.paste(image, ((idx % columns) * env.width, (idx // columns) * env.height))
+
+    sheet.save(output_dir / "contact_sheet.png")
+    print(f"Saved {len(images)} images and a contact sheet to {output_dir.resolve()}")
+
+# if __name__ == "__main__":
+#     import jax
+
+#     env = DmControlEnvironment(
+#         domain_name="cheetah",
+#         task_name="run",
+#         num_buffers=32,
+#         actor_history=1,
+#         width=64,
+#         height=64,
+#     )
+
+#     carry = jax.jit(lambda key: env.initial_carry(key, 32))(jax.random.key(0))
+#     observation = env.current_observation(carry)
+
+#     print(observation.shape)
+#     print(observation.dtype)
+#     print(observation.min(), observation.max())
 
