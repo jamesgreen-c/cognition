@@ -8,15 +8,18 @@ import numpy as np
 
 # ARGS PARSING
 parser = argparse.ArgumentParser()
+parser.add_argument("--domain", type=str, default="cheetah")
+parser.add_argument("--task", type=str, default="run")
+parser.add_argument("--action-repeat", type=int, default=1)
+parser.add_argument("--actor-history", type=int, default=3)
 parser.add_argument("--N", dest="N", type=int, default=1)
-parser.add_argument("--D", dest="D", type=int, default=10)
+parser.add_argument("--D", dest="D", type=int, default=24)
 parser.add_argument("--T", dest="T", type=int, default=8)
 parser.add_argument("--pixels", type=int, default=64)
 parser.add_argument("--rgb", action="store_true")
 parser.add_argument("--stabilise", dest="stabilise", default="clip")
 parser.add_argument("--gamma", dest="gamma", type=float, default=0.99)
 parser.add_argument("--pretrain-iter", dest="pretrain_iter", type=int, default=3000)
-parser.add_argument("--num-iter", dest="num_iter", type=int, default=5000)
 parser.add_argument("--batch-size", dest="batch_size", type=int, default=32)
 parser.add_argument("--seed", dest="seed", type=int, default=1234)
 parser.add_argument("--debug", dest="debug", action="store_true")
@@ -27,7 +30,11 @@ args = parser.parse_args()
 
 
 # LOAD SAVED DATA, PARAMS and LOSS
-EXPERIMENT_NAME = f"D={args.D},N={args.N},T={args.T},iter={args.num_iter},rgb={args.rgb},pixels={args.pixels},stabilise={args.stabilise},seed={args.seed}"
+EXPERIMENT_NAME = (
+    f"domain={args.domain},task={args.task},D={args.D},N={args.N},T={args.T},"
+    f"history={args.actor_history},repeat={args.action_repeat},pretrain={args.pretrain_iter},"
+    f"rgb={args.rgb},pixels={args.pixels},stabilise={args.stabilise},seed={args.seed}"
+)
 DIRPATH = f"results/{EXPERIMENT_NAME}"
 
 if not os.path.exists(DIRPATH):
@@ -38,6 +45,8 @@ with open(f"{DIRPATH}/params.pkl", "rb") as f:
 
 with open(f"{DIRPATH}/loss.pkl", "rb") as f:
     LOSS = pickle.load(f)
+
+NUM_ITER = len(LOSS["model"])
 
 with open(f"{DIRPATH}/buffer.pkl", "rb") as f:
     BUFFER = pickle.load(f)
@@ -62,9 +71,9 @@ def plot_loss():
     actor_losses = LOSS["actor"][5:]
     alpha_losses = LOSS["alpha"][5:]
 
-    def _plot(_loss, _name):
+    def _plot(_loss, _name, start=0):
         plt.figure(figsize=(15, 5))
-        plt.plot(_loss)
+        plt.plot(range(start, start + len(_loss)), _loss)
         plt.xlabel("Iteration")
         plt.ylabel("Loss")
         plt.title(f"{_name} loss over training iterations")
@@ -73,9 +82,9 @@ def plot_loss():
         plt.close()
 
     _plot(model_losses, "model")
-    _plot(critic_losses, "critic")
-    _plot(actor_losses, "actor")
-    _plot(alpha_losses, "alpha")
+    _plot(critic_losses, "critic", 5)
+    _plot(actor_losses, "actor", 5)
+    _plot(alpha_losses, "alpha", 5)
 
 
 def plot_buffer():
@@ -109,6 +118,7 @@ def plot_rpm_params():
         plt.colorbar()
         plt.tight_layout()
         plt.savefig(f"{PLOTDIR}/{_name}.png")
+        plt.close()
 
     A = PARAMS["prior"]["A"]  # (D, D)
     B = PARAMS["prior"]["B"]  # (D, K)
@@ -156,6 +166,7 @@ def plot_training_stats():
 
 if __name__ == "__main__":
 
+    print(f"Loaded {NUM_ITER} training iterations from {DIRPATH}.")
     print(f"Log alpha: {PARAMS['log_alpha']}")
 
     plot_training_stats()
