@@ -32,6 +32,17 @@ class ControlFreeEnergy:
             in_axes=(None, 0, 0)
         )
 
+    def configure(self, config: Config, data: list[Array]):
+        action_dim = data[1].shape[-1]
+
+        self.actor_history = config.actor_history
+        self.batch_size = config.batch_size
+        self.num_buffers = config.num_buffers
+        self.gamma = config.gamma
+        self.actor_state = config.actor_state
+        self.target_entropy = -float(action_dim) if config.target_entropy is None else config.target_entropy
+
+
     def init(
             self,
             key: Array,
@@ -45,15 +56,9 @@ class ControlFreeEnergy:
         ----------
         data: tuple[(B, T, ...)]
         """
-        action_dim = data[1].shape[-1]
-        actor_key, critic_key = jr.split(key)
+        self.configure(config, data)
 
-        self.actor_history = config.actor_history
-        self.batch_size = config.batch_size
-        self.num_buffers = config.num_buffers
-        self.gamma = config.gamma
-        self.actor_state = config.actor_state
-        self.target_entropy = -float(action_dim) if config.target_entropy is None else config.target_entropy
+        actor_key, critic_key = jr.split(key)
 
         if config.sequence_length + 1 < self.actor_history:
             raise ValueError("sequence_length + 1 must be at least actor_history.")

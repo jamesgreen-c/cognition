@@ -20,20 +20,24 @@ class ConstrainedIVFreeEnergy:
     def __init__(self, model: RPSSM):
         self.model = model
 
+    def configure(self, config: Config):
+        """ For easier use in RPSLAC.train_continue() """
+        self.num_timesteps = config.sequence_length + 1
+        self.batch_size = config.batch_size
+        self.num_buffers = config.num_buffers
+        self.num_factors = 1
+
     def init(
             self,
             key: Array,
             data: tuple[Array],
             config: Config
         ) -> tuple[dict, dict[optax.OptState], dict[optax.GradientTransformation]]:
+        self.configure(config)
+
         observations, *_ = data
-
-        self.num_timesteps = config.sequence_length + 1
-        self.batch_size = config.batch_size
-        self.num_buffers = config.num_buffers
-        self.num_factors = 1
-
         params = self.model.init(key, (observations,), config)
+
         opts = {"prior": config.prior.build(), "rpm": config.recognition.build()}
         opt_states = {name: opts[name].init(params[name]) for name in opts}
         return params, opt_states, opts

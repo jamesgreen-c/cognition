@@ -192,7 +192,81 @@ class RPSLAC:
                 alpha_loss="{:.3f}".format(float(losses["alpha"]))
             )
 
-        return self.params, replay_buffer
+        return self.params, replay_buffer, env_states, key
+
+    def train_continue(
+            self,
+            replay_buffer: dict,
+            env_states,
+            params: AllParams,
+            opts: dict,
+            start_itr: int,
+            opt_states: dict,
+            key: PRNGKey,
+            use_pbar: bool = True,
+    ):
+        """Run config.num_iter further online training steps from a checkpoint."""
+        if start_itr < 0 or self.config.num_iter < 1:
+            raise ValueError("start_itr must be nonnegative and num_iter must be positive.")
+
+        self.model.configure(self.config)
+        self.control.configure(self.config, replay_buffer["data"])
+
+        self.params = params
+        self.opt_states = opt_states
+        self.opts = opts
+
+        for name in (
+            "model_losses", "critic_losses", "actor_losses", "alpha_losses",
+            "average_rewards", "actor_stats", "alpha_hist",
+        ):
+            if not hasattr(self, name):
+                setattr(self, name, [])
+
+        compile_environment = self.config.jit and self.env.jax_compatible
+        policy_step = jax.jit(self.policy_step) if compile_environment else self.policy_step
+        collect_step = jax.jit(self.env.collect_step) if compile_environment else self.env.collect_step
+        train_step = jax.jit(self.train_step) if self.config.jit else self.train_step
+
+        end_itr = start_itr + self.config.num_iter
+        pbar = tqdm(range(start_itr, end_itr), disable=not use_pbar, desc="Training")
+        for self.itr in pbar:
+            key, policy_key, env_key, batch_key, train_key = jr.split(key, 5)
+
+            actor_observation = self.env.actor_observation(env_states)
+            actions, log_probs = policy_step(policy_key, self.params["actor"], actor_observation)
+            env_states, new_obs, rewards, flags = collect_step(env_key, env_states, actions)
+            replay_buffer = self._append_experience(replay_buffer, new_obs, actions, rewards, flags, log_probs)
+            batch = self._get_batch(batch_key, replay_buffer)
+
+            self.params, self.opt_states, losses, aux = train_step(train_key, 
+                                                                   self.itr, 
+                                                                   self.params, 
+                                                                   self.opt_states, 
+                                                                   batch)
+            self._stabilise_params()
+
+            size = int(replay_buffer["size"])
+            average_reward = replay_buffer["data"][2][:, :size].mean()
+
+            self.model_losses.append(losses["model"])
+            self.critic_losses.append(losses["critic"])
+            self.actor_losses.append(losses["actor"])
+            self.alpha_losses.append(losses["alpha"])
+            self.average_rewards.append(average_reward)
+            self.actor_stats.append(aux)
+            self.alpha_hist.append(float(self.params["log_alpha"]))
+
+            pbar.set_postfix(
+                average_reward="{:.4f}".format(float(average_reward)),
+                model_loss="{:.3f}".format(float(losses["model"])),
+                critic_loss="{:.3f}".format(float(losses["critic"])),
+                actor_loss="{:.3f}".format(float(losses["actor"])),
+                alpha_loss="{:.3f}".format(float(losses["alpha"])),
+            )
+
+        self.itr = end_itr
+        return self.params, replay_buffer, env_states, key
     
     def init(self, key: PRNGKey, initial_batch: tuple[Array]):
         """ initialise all agent parameters """

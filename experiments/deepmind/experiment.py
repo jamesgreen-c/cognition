@@ -1,6 +1,7 @@
 import os
 import argparse
 
+
 # ARGS PARSING
 parser = argparse.ArgumentParser()
 parser.add_argument("--domain", type=str, default="cheetah")
@@ -20,6 +21,8 @@ parser.add_argument("--batch-size", type=int, default=32)
 parser.add_argument("--capacity", type=int, default=2500)
 parser.add_argument("--eval-episodes", type=int, default=10)
 parser.add_argument("--seed", type=int, default=1234)
+parser.add_argument("--continue", dest="continue_run", action="store_true")
+parser.add_argument("--verbose-warp", dest="verbose_warp", action="store_true")
 parser.add_argument("--debug", action="store_true")
 parser.add_argument("--platform", choices=("cpu", "cuda"), default="cuda")
 args = parser.parse_args()
@@ -28,8 +31,15 @@ os.environ["JAX_PLATFORMS"] = args.platform
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 os.environ["XLA_FLAGS"] = "--xla_gpu_enable_triton_gemm=false"
 
-import pickle
+if not args.verbose_warp:
+    import warp as wp
+    wp.config.log_level = wp.LOG_WARNING
 
+import pickle
+import tempfile
+from pathlib import Path
+
+import cloudpickle
 import jax
 import numpy as np
 import jax.random as jr
@@ -73,10 +83,73 @@ CONFIG, MODEL_FE, CONTROL_FE = setup(
 # create results directory
 EXPERIMENT_NAME = (
     f"domain={args.domain},task={args.task},D={args.D},N={args.N},T={args.T},"
-    f"iter={args.num_iter},history={args.actor_history},repeat={args.action_repeat},"
+    f"history={args.actor_history},repeat={args.action_repeat},pretrain={args.pretrain_iter},"
     f"rgb={args.rgb},pixels={args.pixels},stabilise={args.stabilise},seed={args.seed}"
 )
 DIRPATH = f"results/{EXPERIMENT_NAME}"
+
+
+def find_checkpoint():
+    """Find the checkpoint for this experiment's stable directory name."""
+    path = Path(DIRPATH)
+    required = ("params.pkl", "opt_states.pkl", "opts.pkl",
+                "env_states.pkl", "key.pkl", "loss.pkl", "buffer.pkl",
+                "rewards.pkl", "log_alphas.pkl", "actor_stats.pkl")
+    missing = [name for name in required if not (path / name).is_file()]
+    if missing:
+        raise FileNotFoundError(f"Missing checkpoint files in {path}: {', '.join(missing)}")
+
+    requested_config = vars(args).copy()
+    for ignored in ("num_iter", "continue_run", "eval_episodes", "debug", "platform", "verbose_warp"):
+        requested_config.pop(ignored)
+
+    
+    metadata_path = path / "run_config.pkl"
+    if metadata_path.is_file():
+        with metadata_path.open("rb") as f:
+            if pickle.load(f) != requested_config:
+                raise ValueError(f"Checkpoint settings do not match this experiment: {path}")
+    return path
+
+
+def load_checkpoint(trainer, path):
+
+    def read(name):
+        with (path / name).open("rb") as f:
+            return pickle.load(f)
+
+    params = read("params.pkl")
+    replay_buffer = read("buffer.pkl")
+    opt_states = read("opt_states.pkl")
+    opts = read("opts.pkl")
+    env_states = read("env_states.pkl")
+    key = read("key.pkl")
+
+    losses = read("loss.pkl")
+    completed = len(losses["model"])
+    trainer.model_losses = losses["model"]
+    trainer.critic_losses = losses["critic"]
+    trainer.actor_losses = losses["actor"]
+    trainer.alpha_losses = losses["alpha"]
+
+    trainer.average_rewards = read("rewards.pkl")
+    trainer.alpha_hist = read("log_alphas.pkl")
+    stats = read("actor_stats.pkl")
+    trainer.actor_stats = [dict(mean=mean, std=std) for mean, std in zip(stats["mean"], stats["std"])]
+
+    histories = (trainer.critic_losses, trainer.actor_losses, trainer.alpha_losses,
+                 trainer.average_rewards, trainer.alpha_hist, trainer.actor_stats)
+    
+    if any(len(history) != completed for history in histories):
+        raise ValueError(f"Inconsistent training history lengths in {path}.")
+    
+    if (len(replay_buffer["data"][0]) != args.N
+            or len(replay_buffer["data"][1][0]) != args.capacity
+            or replay_buffer["size"] < args.T):
+        raise ValueError(f"Replay buffer dimensions do not match this experiment: {path}.")
+
+    print(f"Loaded checkpoint from {path} ({completed} training steps).")
+    return params, replay_buffer, env_states, opts, opt_states, key, completed
 
 def main():
 
@@ -86,44 +159,65 @@ def main():
         environment=ENV, 
         config=CONFIG
     )
-    _, replay_buffer = trainer.fit(use_pbar=True)
+    if args.continue_run:
+        checkpoint_path = find_checkpoint()
+        params, replay_buffer, env_states, opts, opt_states, key, completed = load_checkpoint(trainer, checkpoint_path)
+
+        print(f"Continuing {checkpoint_path} from step {completed} to {completed + args.num_iter}.")
+
+        _, replay_buffer, env_states, key = trainer.train_continue(replay_buffer, 
+                                                                   env_states, 
+                                                                   params, 
+                                                                   opts=opts, 
+                                                                   opt_states=opt_states,
+                                                                   start_itr=completed, 
+                                                                   key=key, 
+                                                                   use_pbar=True)
+    else:
+        if (Path(DIRPATH) / "params.pkl").exists():
+            raise FileExistsError(f"An experiment already exists in {DIRPATH}; use --continue to extend it.")
+        
+        _, replay_buffer, env_states, key = trainer.fit(use_pbar=True)
 
     if not os.path.exists(DIRPATH):
         os.makedirs(DIRPATH, exist_ok=True)
 
-    # save params
-    with open(f"{DIRPATH}/params.pkl", "wb") as f: 
-        pickle.dump(trainer.params, f)
+    run_config = vars(args).copy()
+    for ignored in ("num_iter", "continue_run", "eval_episodes", "debug", "platform", "verbose_warp"):
+        run_config.pop(ignored)
 
-    # save losses
-    with open(f"{DIRPATH}/loss.pkl", "wb") as f: 
-        losses = {
-            "model": trainer.model_losses, 
-            "critic": trainer.critic_losses, 
+    checkpoint = {
+        "params.pkl": trainer.params,
+        "opt_states.pkl": trainer.opt_states,
+        "opts.pkl": trainer.opts,
+        "env_states.pkl": env_states,
+        "key.pkl": key,
+        "run_config.pkl": run_config,
+        "loss.pkl": {
+            "model": trainer.model_losses,
+            "critic": trainer.critic_losses,
             "actor": trainer.actor_losses,
-            "alpha": trainer.alpha_losses
-        }
-        pickle.dump(losses, f)
+            "alpha": trainer.alpha_losses,
+        },
+        "buffer.pkl": replay_buffer,
+        "rewards.pkl": trainer.average_rewards,
+        "log_alphas.pkl": trainer.alpha_hist,
+        "actor_stats.pkl": {
+            "mean": np.array([stat["mean"] for stat in trainer.actor_stats]),
+            "std": np.array([stat["std"] for stat in trainer.actor_stats]),
+        },
+    }
 
-    # save replay buffer
-    with open(f"{DIRPATH}/buffer.pkl", "wb") as f: 
-        pickle.dump(replay_buffer, f)
-
-    # save average rewards
-    with open(f"{DIRPATH}/rewards.pkl", "wb") as f:
-        pickle.dump(trainer.average_rewards, f)
-
-    # save log alphas
-    with open(f"{DIRPATH}/log_alphas.pkl", "wb") as f:
-        pickle.dump(trainer.alpha_hist, f)
-
-    # save actor stats history
-    actor_stats = trainer.actor_stats
-    means = np.array([_s["mean"] for _s in trainer.actor_stats])
-    stds = np.array([_s["std"] for _s in trainer.actor_stats])
-    actor_stats = {"mean": means, "std": stds}
-    with open(f"{DIRPATH}/actor_stats.pkl", "wb") as f:
-        pickle.dump(actor_stats, f)
+    # finish every serialization before replacing files from an existing checkpoint.
+    with tempfile.TemporaryDirectory(dir=DIRPATH) as staging:
+        for name, value in checkpoint.items():
+            with open(Path(staging) / name, "wb") as f:
+                if name == "opts.pkl":
+                    cloudpickle.dump(value, f)
+                else:
+                    pickle.dump(value, f)
+        for name in checkpoint:
+            os.replace(Path(staging) / name, Path(DIRPATH) / name)
 
     return trainer
 
@@ -182,4 +276,3 @@ def evaluate_policy(trainer: RPSLAC):
 if __name__ == "__main__":
     trainer = main()
     # evaluate_policy(trainer)
-
