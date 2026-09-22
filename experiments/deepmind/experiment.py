@@ -6,7 +6,7 @@ import argparse
 parser = argparse.ArgumentParser()
 parser.add_argument("--domain", type=str, default="cheetah")
 parser.add_argument("--task", type=str, default="run")
-parser.add_argument("--action-repeat", type=int, default=1)
+parser.add_argument("--action-repeat", type=int, default=4)
 parser.add_argument("--actor-history", type=int, default=3)
 parser.add_argument("--N", type=int, default=1)
 parser.add_argument("--D", type=int, default=24)
@@ -48,6 +48,8 @@ from rp_slac.training import RPSLAC
 
 from experiments.deepmind.data import DmControlEnvironment
 from experiments.deepmind.setup import setup
+from experiments.deepmind.utils import find_checkpoint, load_checkpoint
+
 
 # SETUP
 ENV = DmControlEnvironment(
@@ -63,6 +65,7 @@ ENV = DmControlEnvironment(
 
 CONFIG, MODEL_FE, CONTROL_FE = setup(
     sequence_length=args.T,
+    initial_steps=10000,
     latent_dim=args.D,
     actor_history=args.actor_history,
     action_dim=ENV.action_lower.shape[0],
@@ -89,67 +92,6 @@ EXPERIMENT_NAME = (
 DIRPATH = f"results/{EXPERIMENT_NAME}"
 
 
-def find_checkpoint():
-    """Find the checkpoint for this experiment's stable directory name."""
-    path = Path(DIRPATH)
-    required = ("params.pkl", "opt_states.pkl", "opts.pkl",
-                "env_states.pkl", "key.pkl", "loss.pkl", "buffer.pkl",
-                "rewards.pkl", "log_alphas.pkl", "actor_stats.pkl")
-    missing = [name for name in required if not (path / name).is_file()]
-    if missing:
-        raise FileNotFoundError(f"Missing checkpoint files in {path}: {', '.join(missing)}")
-
-    requested_config = vars(args).copy()
-    for ignored in ("num_iter", "continue_run", "eval_episodes", "debug", "platform", "verbose_warp"):
-        requested_config.pop(ignored)
-
-    
-    metadata_path = path / "run_config.pkl"
-    if metadata_path.is_file():
-        with metadata_path.open("rb") as f:
-            if pickle.load(f) != requested_config:
-                raise ValueError(f"Checkpoint settings do not match this experiment: {path}")
-    return path
-
-
-def load_checkpoint(trainer, path):
-
-    def read(name):
-        with (path / name).open("rb") as f:
-            return pickle.load(f)
-
-    params = read("params.pkl")
-    replay_buffer = read("buffer.pkl")
-    opt_states = read("opt_states.pkl")
-    opts = read("opts.pkl")
-    env_states = read("env_states.pkl")
-    key = read("key.pkl")
-
-    losses = read("loss.pkl")
-    completed = len(losses["model"])
-    trainer.model_losses = losses["model"]
-    trainer.critic_losses = losses["critic"]
-    trainer.actor_losses = losses["actor"]
-    trainer.alpha_losses = losses["alpha"]
-
-    trainer.average_rewards = read("rewards.pkl")
-    trainer.alpha_hist = read("log_alphas.pkl")
-    stats = read("actor_stats.pkl")
-    trainer.actor_stats = [dict(mean=mean, std=std) for mean, std in zip(stats["mean"], stats["std"])]
-
-    histories = (trainer.critic_losses, trainer.actor_losses, trainer.alpha_losses,
-                 trainer.average_rewards, trainer.alpha_hist, trainer.actor_stats)
-    
-    if any(len(history) != completed for history in histories):
-        raise ValueError(f"Inconsistent training history lengths in {path}.")
-    
-    if (len(replay_buffer["data"][0]) != args.N
-            or len(replay_buffer["data"][1][0]) != args.capacity
-            or replay_buffer["size"] < args.T):
-        raise ValueError(f"Replay buffer dimensions do not match this experiment: {path}.")
-
-    print(f"Loaded checkpoint from {path} ({completed} training steps).")
-    return params, replay_buffer, env_states, opts, opt_states, key, completed
 
 def main():
 
@@ -160,8 +102,8 @@ def main():
         config=CONFIG
     )
     if args.continue_run:
-        checkpoint_path = find_checkpoint()
-        params, replay_buffer, env_states, opts, opt_states, key, completed = load_checkpoint(trainer, checkpoint_path)
+        checkpoint_path = find_checkpoint(DIRPATH, args)
+        params, replay_buffer, env_states, opts, opt_states, key, completed = load_checkpoint(trainer, checkpoint_path, args)
 
         print(f"Continuing {checkpoint_path} from step {completed} to {completed + args.num_iter}.")
 
@@ -222,57 +164,5 @@ def main():
     return trainer
 
 
-def evaluate_policy(trainer: RPSLAC):
-    if args.eval_episodes < 1:
-        raise ValueError("eval_episodes must be positive.")
-
-    key = jr.PRNGKey(args.seed + 10)
-    key, initial_key = jr.split(key)
-
-    # use the deterministic mean policy
-    @jax.jit
-    def mean_policy_step(actor_params, actor_observation):
-        actor_observation = ENV.preprocess_observation(actor_observation)
-        _mean_policy = lambda observation: trainer.control.mean_policy(actor_params, observation)
-        return jax.vmap(_mean_policy)(actor_observation)
-
-    # compile step sampling steps    
-    initial_carry = jax.jit(lambda init_key: ENV.initial_carry(init_key, args.N))
-    collect_step = jax.jit(ENV.collect_step)
-
-    # run evaluation
-    carry = initial_carry(initial_key)
-    running_returns = np.zeros(args.N, dtype=np.float64)
-    completed_returns = []
-
-    while len(completed_returns) < args.eval_episodes:
-        key, env_key = jr.split(key)
-        actor_observation = ENV.actor_observation(carry)
-        actions = mean_policy_step(trainer.params["actor"], actor_observation)
-        carry, _, rewards, flags = collect_step(env_key, carry, actions)
-
-        running_returns += np.asarray(rewards)
-        episode_ends = np.asarray(flags) == 0.0
-        completed_returns.extend(running_returns[episode_ends].tolist())
-        running_returns[episode_ends] = 0.0
-
-    # store returns and save to disc
-    episode_returns = np.asarray(completed_returns[:args.eval_episodes], dtype=np.float64)
-    results = {
-        "episode_returns": episode_returns,
-        "mean_return": float(episode_returns.mean()),
-        "std_return": float(episode_returns.std()),
-    }
-
-    with open(f"{DIRPATH}/evaluation.pkl", "wb") as f:
-        pickle.dump(results, f)
-
-    print("Average return over {} episodes: {:.2f} ± {:.2f}".format(args.eval_episodes,
-                                                                    results["mean_return"],
-                                                                    results["std_return"]))
-
-    return results
-
 if __name__ == "__main__":
     trainer = main()
-    # evaluate_policy(trainer)

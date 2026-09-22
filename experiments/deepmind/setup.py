@@ -14,6 +14,7 @@ from rp_slac.free_energy.control_fe import ControlFreeEnergy
 
 def setup(
         sequence_length: int,
+        initial_steps: int,
         latent_dim: int,
         actor_history: int,
         action_dim: int,
@@ -39,6 +40,7 @@ def setup(
         batch_size=batch_size,
         num_buffers=num_buffers,
         actor_history=actor_history,
+        initial_steps=initial_steps,
         capacity=capacity,
         gamma=gamma,
         actor_state="observation",
