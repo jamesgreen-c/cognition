@@ -6,6 +6,7 @@ import os
 parser = argparse.ArgumentParser()
 parser.add_argument("--domain", type=str, default="cheetah")
 parser.add_argument("--task", type=str, default="run")
+parser.add_argument("--initial-collection", type=int, default=10000)
 parser.add_argument("--action-repeat", type=int, default=4)
 parser.add_argument("--actor-history", type=int, default=3)
 parser.add_argument("--N", type=int, default=1)

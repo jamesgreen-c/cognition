@@ -102,6 +102,8 @@ def plot_buffer():
 
     _plot(actions[0], "actions")
     _plot(rewards[0], "rewards")
+    print("rewards shape: ", rewards.shape)
+    print(rewards[0])
 
     
 def plot_rpm_params():
@@ -172,5 +174,5 @@ if __name__ == "__main__":
     plot_training_stats()
     plot_buffer()
     plot_loss()
-    plot_rpm_params()
+    # plot_rpm_params()
     plot_actor_stats()

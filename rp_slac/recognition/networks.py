@@ -17,6 +17,18 @@ class MLP(nn.Module):
         return x
 
 
+class TanhMLP(nn.Module):
+    """Simple MLP with tanh activation and no final Dense layer."""
+    features : Sequence[int]
+
+    @nn.compact
+    def __call__(self, x: Array) -> Array:
+        for feat in self.features:
+            x = nn.Dense(feat)(x)
+            x = nn.tanh(x)
+        return x
+
+
 class CNN(nn.Module):
     """Simple CNN with no final Dense layer."""
     cnn_features : Sequence[dict]

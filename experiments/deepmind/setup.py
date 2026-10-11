@@ -7,9 +7,10 @@ from rp_slac import critic
 from rp_slac.config import Config
 from rp_slac import distributions
 
-from rp_slac.recognition import rpm, networks, distmaps
-from rp_slac.free_energy.model_fe import ConstrainedIVFreeEnergy
+from rp_slac.recognition import networks, distmaps
+from rp_slac.free_energy.ramp_fe import ConstrainedIVFreeEnergy
 from rp_slac.free_energy.control_fe import ControlFreeEnergy
+from rp_slac.recognition import rpm, ramp 
 
 
 def setup(
@@ -28,7 +29,6 @@ def setup(
         capacity: int,
         gamma: float,
         seed: int,
-        stabilise_A: str | None = "scale",
 ):
     D = latent_dim
     K = action_dim
@@ -45,7 +45,7 @@ def setup(
         gamma=gamma,
         actor_state="observation",
         jit=True,
-        stabilise_A=stabilise_A,
+        stabilise_A=None,
         seed=seed,
         target_update_rate=0.005
     )
@@ -56,11 +56,6 @@ def setup(
     CFG.actor.lr = 3e-4
     CFG.critic.lr = 3e-4
     CFG.alpha.lr = 3e-4
-
-    # prior definition
-    A = jnp.zeros((D, D))
-    B = jnp.ones((D, K))
-    PRIOR = distributions.LGStationaryParam(stationary=True, A=A, B=B)
 
     # recognition definition
     last_kernel = (pixels + 15) // 16
@@ -77,9 +72,18 @@ def setup(
         dist_map=distmaps.MVNDiag(D),
         constant_cov=True,
     )
+    RPM = rpm.GaussianRecognition(
+        networks.TanhMLP([128, 128, 128]), 
+        distmaps.MVNCholeskySoftplus(latent_dim)
+    ) 
 
     # model definition
-    MODEL = rpm.RPSSM(prior=PRIOR, recognition=(REC,))
+    MODEL = ramp.RAMPSSM(
+        latent_dim=latent_dim,
+        recognition=(REC,),
+        message_network=RPM,
+        action_dim=action_dim,
+    )
     MODEL_FE = ConstrainedIVFreeEnergy(model=MODEL)
 
     # observation-conditioned actor

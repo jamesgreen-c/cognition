@@ -6,6 +6,7 @@ import argparse
 parser = argparse.ArgumentParser()
 parser.add_argument("--domain", type=str, default="cheetah")
 parser.add_argument("--task", type=str, default="run")
+parser.add_argument("--initial-collection", type=int, default=10000)
 parser.add_argument("--action-repeat", type=int, default=4)
 parser.add_argument("--actor-history", type=int, default=3)
 parser.add_argument("--N", type=int, default=1)
@@ -13,7 +14,6 @@ parser.add_argument("--D", type=int, default=24)
 parser.add_argument("--T", type=int, default=8)
 parser.add_argument("--pixels", type=int, default=64)
 parser.add_argument("--rgb", action="store_true")
-parser.add_argument("--stabilise", type=str, default="clip")
 parser.add_argument("--gamma", type=float, default=0.99)
 parser.add_argument("--pretrain-iter", type=int, default=3000)
 parser.add_argument("--num-iter", type=int, default=2500)
@@ -40,9 +40,7 @@ import tempfile
 from pathlib import Path
 
 import cloudpickle
-import jax
 import numpy as np
-import jax.random as jr
 
 from rp_slac.training import RPSLAC
 
@@ -65,7 +63,7 @@ ENV = DmControlEnvironment(
 
 CONFIG, MODEL_FE, CONTROL_FE = setup(
     sequence_length=args.T,
-    initial_steps=10000,
+    initial_steps=args.initial_collection,
     latent_dim=args.D,
     actor_history=args.actor_history,
     action_dim=ENV.action_lower.shape[0],
@@ -79,7 +77,6 @@ CONFIG, MODEL_FE, CONTROL_FE = setup(
     capacity=args.capacity,
     gamma=args.gamma,
     seed=args.seed,
-    stabilise_A=args.stabilise,
 )
 
 
