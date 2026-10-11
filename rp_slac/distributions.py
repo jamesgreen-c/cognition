@@ -329,7 +329,7 @@ class LGStationaryParam:
             new_params['A'] = nn.sigmoid(params['A'])
         return LGStationaryParam(stationary=self.stationary, **new_params)
     
-    def to_chain(self, actions):
+    def to_chain(self, actions, m1=None):
         """
         Construct p(z_1:T | a_1:T-1) as an LGChainDistParam.
 
@@ -350,7 +350,7 @@ class LGStationaryParam:
 
         num_timesteps = actions.shape[0] + 1
 
-        m1 = self.params["m1"]
+        m1 = self.params["m1"] if m1 is None else m1
         Q1 = self.params["Q1"]
         A = self.params["A"]
         B = self.params["B"]

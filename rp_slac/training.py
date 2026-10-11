@@ -78,9 +78,9 @@ class RPSLAC:
 
         # calculate all updates from the previous step parameters
         model_params, model_opt_states, model_loss, filter_posterior = self._update_model(itr,
-                                                                                            params,
-                                                                                            opt_states,
-                                                                                            data)
+                                                                                          params,
+                                                                                          opt_states,
+                                                                                          data)
         # shape = filter_posterior.params["mean"].shape[:-1]
         latents = filter_posterior.sample(sampling_key, shape=None)   # filter_posterior.mean
 
