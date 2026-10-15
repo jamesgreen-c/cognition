@@ -29,13 +29,22 @@ class DistMap:
 
 class MVNDiag(DistMap):
 
+    def __init__(self, latent_dim: int, max_precision: float | None = None):
+        super().__init__(latent_dim)
+        if max_precision is not None and max_precision <= 0:
+            raise ValueError('max_precision must be positive.')
+        self.max_precision = max_precision
+
     @property
     def input_dim(self):
         return self.latent_dim * 2
     
     def __call__(self, x: Array) -> GaussianNatParam:
         pwm = x[:self.latent_dim]
-        p = jnp.diag(nn.softplus(x[self.latent_dim:]))
+        diagonal = nn.softplus(x[self.latent_dim:])
+        if self.max_precision is not None:
+            diagonal = self.max_precision * nn.tanh(diagonal / self.max_precision)
+        p = jnp.diag(diagonal)
         
         return GaussianNatParam(p=p, pwm=pwm)
 
@@ -93,6 +102,12 @@ class MVNCholesky(DistMap):
 
 class MVNCholeskySoftplus(DistMap):
 
+    def __init__(self, latent_dim: int, max_chol: float | None = None):
+        super().__init__(latent_dim)
+        if max_chol is not None and max_chol <= 0:
+            raise ValueError('max_chol must be positive.')
+        self.max_chol = max_chol
+
     @property
     def input_dim(self):
         return self.latent_dim + self.latent_dim * (self.latent_dim + 1) // 2
@@ -101,9 +116,14 @@ class MVNCholeskySoftplus(DistMap):
         pwm = x[:self.latent_dim]
         p_lower_tri = x[self.latent_dim:-self.latent_dim]
         p_diag = x[-self.latent_dim:]
+
+        p_diag = nn.softplus(p_diag)
+        if self.max_chol is not None:
+            p_diag = self.max_chol * nn.tanh(p_diag / self.max_chol)
+            p_lower_tri = self.max_chol * nn.tanh(p_lower_tri / self.max_chol)
     
         L = jnp.zeros((self.latent_dim, self.latent_dim))
-        L = L.at[jnp.diag_indices(self.latent_dim)].set(nn.softplus(p_diag))
+        L = L.at[jnp.diag_indices(self.latent_dim)].set(p_diag)
         L = L.at[jnp.tril_indices(self.latent_dim, -1)].set(p_lower_tri)
         p = L @ L.T + EPS * jnp.eye(self.latent_dim)
 
