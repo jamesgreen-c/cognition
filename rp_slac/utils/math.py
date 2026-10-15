@@ -1,4 +1,5 @@
 import jax.numpy as jnp
+from jax import vmap
 
 from jax.scipy.linalg import solve_triangular
 
@@ -30,6 +31,48 @@ def logdet(S):
     L = jnp.linalg.cholesky(S)
     logdet = 2 * jnp.sum(jnp.log(jnp.diag(L)))
     return logdet
+
+
+def precision_mean_and_chol(precision, weighted_mean):
+    """Unbatched Gaussian mean and Cholesky factor, using triangular solves."""
+    precision = 0.5 * (precision + precision.T)
+    chol = jnp.linalg.cholesky(precision)
+    mean = solve_triangular(
+        chol.T, solve_triangular(chol, weighted_mean, lower=True), lower=False
+    )
+    return mean, chol
+
+
+def _gaussian_kl_precision(pq, hq, pp, hp):
+    """KL(q || p), avoiding subtraction of large Gaussian log normalizers."""
+    mq, lq = precision_mean_and_chol(pq, hq)
+    mp, lp = precision_mean_and_chol(pp, hp)
+    relative = solve_triangular(lq, lp, lower=True)
+    diagonal = jnp.diag(relative)
+    x = diagonal - 1.0
+    # d^2 - 1 - 2 log(d) is nonnegative, but cancels near d=1.
+    series = x * x * (2.0 - (2.0 / 3.0) * x + 0.5 * x * x - 0.4 * x**3)
+    exact = (diagonal - 1.0) * (diagonal + 1.0) - 2.0 * jnp.log(diagonal)
+    diagonal_term = jnp.where(jnp.abs(x) < 1e-3, series, exact)
+    off_diagonal = relative - jnp.diag(diagonal)
+    covariance_term = jnp.sum(off_diagonal**2) + jnp.sum(diagonal_term)
+    mean_term = jnp.sum((lp.T @ (mq - mp))**2)
+    return 0.5 * (covariance_term + mean_term)
+
+
+def gaussian_kl_precision(pq, hq, pp, hp):
+    """Stable Gaussian KL with optional broadcast batch dimensions."""
+    shape = jnp.broadcast_shapes(pq.shape[:-2], hq.shape[:-1], pp.shape[:-2], hp.shape[:-1])
+    if not shape:
+        return _gaussian_kl_precision(pq, hq, pp, hp)
+    dim = hq.shape[-1]
+    arrays = (
+        jnp.broadcast_to(pq, shape + (dim, dim)).reshape((-1, dim, dim)),
+        jnp.broadcast_to(hq, shape + (dim,)).reshape((-1, dim)),
+        jnp.broadcast_to(pp, shape + (dim, dim)).reshape((-1, dim, dim)),
+        jnp.broadcast_to(hp, shape + (dim,)).reshape((-1, dim)),
+    )
+    return vmap(_gaussian_kl_precision)(*arrays).reshape(shape)
 
 
 def scale_sv(A, eps):

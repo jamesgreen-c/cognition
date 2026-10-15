@@ -13,7 +13,7 @@ from flax.core.frozen_dict import FrozenDict
 from tensorflow_probability.substrates.jax.distributions import MultivariateNormalFullCovariance as MVN
 
 from rp_slac.utils.vmapping import auto_vmap
-from rp_slac.utils.math import spd_inverse, inv_quad_form, inv_quad_form_symmetric
+from rp_slac.utils.math import spd_inverse, inv_quad_form, inv_quad_form_symmetric, gaussian_kl_precision
 
 
 
@@ -73,8 +73,7 @@ class NatParam:
         pass
 
     def kl(self, other):
-        return (self.expsuffstat_dot(self - other)
-                - self.lognormalizer + other.lognormalizer)
+        return (self.expsuffstat_dot(self - other) - self.lognormalizer + other.lognormalizer)
     
     def update(self, params):
         flattened_params = self.flatten(params)
@@ -184,6 +183,28 @@ class GaussianNatParam(NatParam):
     """
     # p: Array
     # pwm: Array
+
+    # def kl(self, other):
+    #     """Gaussian KL using mean differences and relative Cholesky factors."""
+    #     return gaussian_kl_precision(
+    #         self.params['p'], self.params['pwm'], other.params['p'], other.params['pwm']
+    #     )
+
+    def kl(self, other):
+        """More numerically stable KL divergence function for Gaussians"""
+        q = self.dist_param
+        p = other.dist_param
+
+        delta = q.params["mean"] - p.params["mean"]
+        precision_p = other.params["p"]
+
+        trace = jnp.trace(precision_p @ q.params["cov"], axis1=-2, axis2=-1)
+        quadratic = jnp.einsum("...i,...ij,...j->...", delta, precision_p, delta)
+
+        logdet_q = jnp.linalg.slogdet(self.params["p"])[1]
+        logdet_p = jnp.linalg.slogdet(precision_p)[1]
+
+        return 0.5 * (trace + quadratic - self.latent_dim + logdet_q - logdet_p)
 
     def flatten(self, params):
         assert {'pwm', 'chol'} <= set(params)
@@ -357,7 +378,6 @@ class LGStationaryParam:
         b = self.params["b"]
         Q = self.params["Q"]
 
-        
         As = jnp.tile(A[None], (num_timesteps, 1, 1))
         Qs = jnp.concatenate([Q1[None], jnp.tile(Q[None], (num_timesteps-1, 1, 1))])
 
@@ -510,3 +530,77 @@ class LGChainDistParam(DistParam):
         B = means.shape[0]
         keys = jax.random.split(key, B)
         return vmap(sample_trajectory)(keys, means, covs, cross_covs)
+
+
+class LGFilterDistParam(DistParam):
+    """A causal Gaussian path with Kalman-filter marginals.
+
+    Parameters are 'mean', 'cov', 'conditional_weights', 'conditional_covs'.
+    The first two hold m_t, P_t from Dynamax filtering. The last two specify
+    the forward coupling
+
+        z_0 ~ N(m_0, P_0),
+        z_t | z_{t-1} ~ N(m_t + F_t (z_{t-1} - m_{t-1}), V_t).
+
+    utils.kalman constructs F_t, V_t using a stochastic Kalman update, so
+    F_t P_{t-1} F_t.T + V_t = P_t. This selects a Gaussian joint with the
+    desired filtering marginals; those marginals alone do not define a joint.
+    It is a causal surrogate path, not the full-data smoothing posterior or
+    the product of locally normalised p(z_t | z_{t-1}) f_t(z_t) kernels.
+
+    Shapes are (..., T, D), (..., T, D, D), and (..., T-1, D, D) for both
+    conditional arrays. No chain KL calculation is provided.
+    """
+
+    # mean: Array
+    # cov: Array
+    # conditional_weights: Array
+    # conditional_covs: Array
+
+    @property
+    def mean_field(self):
+        return GaussianDistParam(mean=self.params['mean'], cov=self.params['cov'])
+
+    @property
+    def cross_covs(self):
+        """Cov(z_{t+1}, z_t) under this particular forward coupling."""
+        return self.params['conditional_weights'] @ self.params['cov'][..., :-1, :, :]
+
+    def sample(self, key: jax.Array, *args, **kwargs):
+        """Sample one joint trajectory per batch member, proceeding forward."""
+
+        means = self.params['mean']
+        covs = self.params['cov']
+        weights = self.params['conditional_weights']
+        noise_covs = self.params['conditional_covs']
+
+        def sample_trajectory(key, means, covs, weights, noise_covs):
+
+            keys = vmap(lambda t: jax.random.fold_in(key, t))(jnp.arange(means.shape[0]))
+            initial = multivariate_normal(keys[0], means[0], covs[0])
+
+            def step(previous, inputs):
+                subkey, mean, previous_mean, weight, noise_cov = inputs
+                conditional_mean = mean + weight @ (previous - previous_mean)
+                state = multivariate_normal(subkey, conditional_mean, noise_cov)
+                return state, state
+
+            inputs = (keys[1:], means[1:], means[:-1], weights, noise_covs)
+            _, states = jax.lax.scan(step, initial, inputs)
+            return jnp.concatenate((initial[None], states), axis=0)
+
+        if means.ndim == 2:
+            return sample_trajectory(key, means, covs, weights, noise_covs)
+
+        times, dim = means.shape[-2:]
+        flat_means = means.reshape((-1, times, dim))
+        flat_covs = covs.reshape((-1, times, dim, dim))
+
+        # Specify the flattened batch explicitly, since T-1 can be zero.
+        batch = flat_means.shape[0]
+        flat_weights = weights.reshape((batch, times - 1, dim, dim))
+        flat_noise = noise_covs.reshape((batch, times - 1, dim, dim))
+
+        keys = vmap(lambda b: jax.random.fold_in(key, b))(jnp.arange(batch))
+        samples = vmap(sample_trajectory)(keys, flat_means, flat_covs, flat_weights, flat_noise)
+        return samples.reshape(means.shape)
