@@ -14,6 +14,7 @@ class JAXCarry(NamedTuple):
 
     state: Any
     observations: Array
+    actions: Array | None = None
 
 
 class JAXEnvironment(ABC):
@@ -34,8 +35,10 @@ class JAXEnvironment(ABC):
         state_key, observation_key = jr.split(key)
         states = vmap(self.initial_state)(jr.split(state_key, num_samples))
         observations = vmap(self.observe)(jr.split(observation_key, num_samples), states)
+        example_action, _ = self.random_action(jr.fold_in(key, 0), observations[0])
+        past_actions = jnp.zeros((num_samples, self.actor_history - 1, example_action.shape[-1]), dtype=example_action.dtype)
         observations = self._initial_actor_observations(observations)
-        return JAXCarry(state=states, observations=observations)
+        return JAXCarry(state=states, observations=observations, actions=past_actions)
 
     def collect_step(
             self,
@@ -67,12 +70,29 @@ class JAXEnvironment(ABC):
         observation_history = self._select(episode_ends, reset_observations, rolled_observations)
 
         flags = 1.0 - episode_ends.astype(jnp.float32)
-        next_carry = JAXCarry(state=next_states, observations=observation_history)
+        action_history = self._append_actor_action(carry.actions, actions, episode_ends)
+        next_carry = JAXCarry(state=next_states, observations=observation_history, actions=action_history)
         return next_carry, next_observations, rewards, flags
 
     def actor_observation(self, carry: JAXCarry) -> Array:
         """Concatenate oldest-to-newest observations along the feature axis."""
         return self._stack_actor_observations(carry.observations)
+
+    @staticmethod
+    def actor_history_data(carry: JAXCarry):
+        """Raw frame history and its preceding actions for a shared encoder."""
+        if carry.actions is None:
+            raise ValueError('This carry predates action-history support; start a fresh run.')
+        return carry.observations, carry.actions
+
+    @staticmethod
+    def _append_actor_action(history, actions, episode_ends):
+        if history is None:
+            return None  # Legacy environments using their original actor input.
+        if history.shape[1] == 0:
+            return history
+        rolled = jnp.concatenate((history[:, 1:], actions[:, None]), axis=1)
+        return jnp.where(episode_ends[:, None, None], jnp.zeros_like(rolled), rolled)
 
     @staticmethod
     def current_observation(carry: JAXCarry) -> Array:
@@ -137,6 +157,7 @@ class MuJoCoCarry(NamedTuple):
     state: Any
     frames: Array
     episode_steps: Array
+    actions: Array | None = None
 
 
 class MuJoCoSimulationEnvironment(ABC):
@@ -197,10 +218,12 @@ class MuJoCoSimulationEnvironment(ABC):
 
         state = self.initial_state(key, num_samples)
         state, observation = self._observe(state)
+        lower, _ = self._action_bounds()
         return MuJoCoCarry(
             state=state,
             frames=self._initial_actor_frames(observation),
             episode_steps=jnp.zeros((num_samples,), dtype=jnp.int32),
+            actions=jnp.zeros((num_samples, self.actor_history - 1, lower.shape[-1]), dtype=lower.dtype),
         )
 
     def _step(self, state, action: Array):
@@ -248,7 +271,8 @@ class MuJoCoSimulationEnvironment(ABC):
         episode_steps = jnp.where(episode_ends, 0, episode_steps)
         flags = 1.0 - episode_ends.astype(jnp.float32)
 
-        next_carry = MuJoCoCarry(state=next_state, frames=next_frames, episode_steps=episode_steps)
+        action_history = self._append_actor_action(carry.actions, actions, episode_ends)
+        next_carry = MuJoCoCarry(state=next_state, frames=next_frames, episode_steps=episode_steps, actions=action_history)
         return next_carry, next_observation, rewards, flags
 
     @classmethod
@@ -284,6 +308,12 @@ class MuJoCoSimulationEnvironment(ABC):
         return self._stack_actor_frames(carry.frames)
 
     @staticmethod
+    def actor_history_data(carry: MuJoCoCarry):
+        if carry.actions is None:
+            raise ValueError('This carry predates action-history support; start a fresh run.')
+        return carry.frames, carry.actions
+
+    @staticmethod
     def current_observation(carry: MuJoCoCarry) -> Array:
         """Return the most recent raw frame for replay storage."""
         return carry.frames[:, -1]
@@ -296,9 +326,19 @@ class MuJoCoSimulationEnvironment(ABC):
         return jnp.concatenate((frames[:, 1:], frame[:, None]), axis=1)
 
     @staticmethod
+    def _append_actor_action(history, actions, episode_ends):
+        if history is None:
+            return None  # Legacy environments using their original actor input.
+        if history.shape[1] == 0:
+            return history
+        rolled = jnp.concatenate((history[:, 1:], actions[:, None]), axis=1)
+        return jnp.where(episode_ends[:, None, None], jnp.zeros_like(rolled), rolled)
+
+    @staticmethod
     def _stack_actor_frames(frames: Array) -> Array:
         """Convert ``(N, F, H, W, C)`` into ``(N, H, W, F * C)``."""
         num_buffers, history, height, width, channels = frames.shape
         frames = jnp.transpose(frames, (0, 2, 3, 1, 4))
         return frames.reshape(num_buffers, height, width, history * channels)
 
+    

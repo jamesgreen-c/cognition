@@ -46,7 +46,8 @@ class OptimConfig:
 @dataclass
 class Config:
     # replay sampling
-    batch_size: int = 32           # B windows from each replay buffer
+    model_batch_size: int = 32           # B windows from each replay buffer for model updates
+    sac_batch_size: int = 256            # B windows from each replay buffer for SAC updates 
     sequence_length: int = 50      # tau transitions; observations have tau + 1
     num_buffers: int = 1           # N independent chronological buffers
 
