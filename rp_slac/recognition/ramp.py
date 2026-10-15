@@ -10,7 +10,9 @@ r_j = eta(f_j) - eta(f0), so f_j has parameters prior + r_j.
 Positive message precisions restrict the family, but ensure normalisability.
 
 The parameter groups match rpm.py: 'rpm' contains observation recognisers;
-'prior' contains the two message networks, not parameters of f0.
+'prior' contains the two message networks and the optional reward predictor,
+not parameters of f0. Rewards supervise causal beliefs through an auxiliary
+prediction loss; they are never inputs to the image encoder or messages.
 
 Actions, when used, are observed leaves on the transition factors. Each
 candidate subtree carries its own actions in the empirical mixtures.
@@ -46,19 +48,35 @@ from jax import Array, lax, vmap
 from jax.tree_util import tree_map
 
 from rp_slac.distributions import GaussianDistParam, GaussianNatParam
-from rp_slac.recognition.distmaps import MVNCholeskySoftplus
 from rp_slac.recognition.rpm import GaussianRecognition
 from rp_slac.config import Config
 
 
-class MessageFeatures(nn.Module):
-    """Nonlinear features; GaussianRecognition supplies the final head."""
+# class MessageFeatures(nn.Module):
+#     """Nonlinear features; GaussianRecognition supplies the final head."""
 
-    hidden_dim: int = 128
+#     hidden_dim: int = 128
 
-    @nn.compact
-    def __call__(self, x: Array) -> Array:
-        return nn.tanh(nn.Dense(self.hidden_dim)(x))
+#     @nn.compact
+#     def __call__(self, x: Array) -> Array:
+#         return nn.tanh(nn.Dense(self.hidden_dim)(x))
+
+
+# class RewardPredictor(nn.Module):
+#     """Gaussian p(r_t | z_t, a_t, z_{t+1}); no image reconstruction."""
+
+#     features: Sequence[int] = (256, 256)
+#     min_std: float = 1e-3
+
+#     @nn.compact
+#     def __call__(self, inputs: Array):
+#         x = inputs
+
+#         for width in self.features:
+#             x = nn.leaky_relu(nn.Dense(width)(x))
+#         x = nn.Dense(2)(x)
+
+#         return x[..., 0], nn.softplus(x[..., 1]) + self.min_std
 
 
 class RAMPSSM:
@@ -83,17 +101,18 @@ class RAMPSSM:
         latent_dim: int,
         recognition: Sequence[GaussianRecognition],
         message_network: GaussianRecognition,
+        reward_network: GaussianRecognition | None = None,
         action_dim: int = 0,
-        hidden_dim: int = 128,
     ):
-        if latent_dim < 1 or hidden_dim < 1 or action_dim < 0 or not recognition:
+        if latent_dim < 1 or action_dim < 0 or not recognition:
             raise ValueError('Use positive dimensions and at least one recogniser.')
         
         self.latent_dim = latent_dim
         self.action_dim = action_dim
         self.recognition = tuple(recognition)
-        self.prior = GaussianNatParam(p=jnp.eye(latent_dim), pwm=jnp.zeros(latent_dim))
         self.message_network = message_network
+        self.reward_network = reward_network
+        self.prior = GaussianNatParam(p=jnp.eye(latent_dim), pwm=jnp.zeros(latent_dim))
 
     def _data(self, data) -> tuple[Array, ...]:
         data = tuple(data) if isinstance(data, (tuple, list)) else (data,)
@@ -130,6 +149,9 @@ class RAMPSSM:
         Only the precision's lower triangle is needed because it is symmetric.
         DistMap acts on one example, hence the vmap over the batch.
 
+        Use arcsinh transformation as a smooth compressor for large natural parameters;
+            recorded actions retain their original scale.
+        
         Parameters
         ----------
         params: Parameters of one directed message network.
@@ -142,32 +164,42 @@ class RAMPSSM:
                     The intermediate network features have shape (B,F).
         """
         rows, cols = jnp.tril_indices(self.latent_dim)
-        features = jnp.concatenate(
-            (ratio.params['pwm'], ratio.params['p'][..., rows, cols], action), axis=-1
-        )
+        features = jnp.concatenate((
+            jnp.arcsinh(ratio.params['pwm']),
+            jnp.arcsinh(ratio.params['p'][..., rows, cols]), 
+            action
+        ), axis=-1)
         return vmap(lambda x: self.message_network.apply(params, x))(features)
 
     def init(self, key: Array, data, config: Config) -> dict:
         """Use the same model-init signature and optimizer groups as RPSSM."""
-        # del config
-        data = self._data(data)
-        keys = jr.split(key, len(self.recognition) + 2)
 
+        data = self._data(data)
+        count = len(self.recognition)
+        keys = jr.split(key, count + 2 + (self.reward_network is not None))
+
+        # encoder params
         rec_params = [
             rec.init(k, x[0, 0])
-            for rec, k, x in zip(self.recognition, keys[:-2], data)
+            for rec, k, x in zip(self.recognition, keys[:count], data)
         ]
+
+        # nodewise rpm params
         input_dim = self.latent_dim + self.latent_dim * (self.latent_dim + 1) // 2
         dummy = jnp.zeros(input_dim + self.action_dim)
-        return {
-            'prior': {
-                'forward': self.message_network.init(keys[-2], dummy),
-                'backward': self.message_network.init(keys[-1], dummy),
-            },
-            'rpm': rec_params,
+        prior_params = {
+            'forward': self.message_network.init(keys[count], dummy),
+            'backward': self.message_network.init(keys[count + 1], dummy),
         }
 
-    def get_factors(self, rec_params, data) -> GaussianNatParam:
+        # optional additional params for reward prediction if used in RAMPSLAC
+        if self.reward_network is not None:
+            reward_inputs = jnp.zeros(2 * self.latent_dim + self.action_dim)
+            prior_params['reward'] = self.reward_network.init(keys[count + 2], reward_inputs)
+        
+        return {'prior': prior_params, 'rpm': rec_params}
+
+    def get_factors(self, rec_params, data, return_features: bool = False):
         """
         Apply the observation recognisers over batch and time.
 
@@ -184,11 +216,15 @@ class RAMPSSM:
 
         if len(rec_params) != len(self.recognition):
             raise ValueError('Recognition parameter count does not match the model.')
-        
-        outs = [
-            vmap(vmap(lambda x: rec.apply(p, x)))(datapoint)
+
+        # apply recognition to data and remove features if not required
+        outputs = [
+            vmap(vmap(lambda x: rec.apply(p, x, return_features=return_features)))(datapoint)
             for rec, p, datapoint in zip(self.recognition, rec_params, data)
         ]
+        outs = [out[0] for out in outputs] if return_features else outputs
+
+        # stack outputted statistics into a single NatParam for all factors
         factors = type(outs[0])(
             **{k: jnp.stack([out.params[k] for out in outs]) 
             for k in outs[0].params.keys()}
@@ -196,7 +232,25 @@ class RAMPSSM:
 
         if factors.latent_dim != self.latent_dim:
             raise ValueError('Recognition and message latent dimensions must match.')
-        return factors
+        return (factors, outputs[0][1]) if return_features else factors
+
+    def get_features(self, rec_params, observations: Array) -> Array:
+        """Encode (B,T,...) frames with the first observation recogniser."""
+        # TODO this should loop over rec: (J,), data: (J,)
+        rec = self.recognition[0]
+        _apply = lambda frame: rec.apply(rec_params[0], frame, method=rec.encode)
+        return vmap(vmap(_apply))(observations)
+
+    def predict_rewards(self, prior_params, latents: Array, actions: Array):
+        """Predict rewards from causal latent pairs and recorded edge actions."""
+
+        if self.reward_network is None:
+            raise ValueError('This RAMP model has no reward predictor.')
+
+        # reward predictor requires actions and transitions
+        inputs = jnp.concatenate((latents[:, :-1], actions, latents[:, 1:]), axis=-1)
+        _apply = lambda inp: self.reward_network.apply(prior_params["reward"], inp)
+        return vmap(vmap(_apply))(inputs)
 
     def _pass(self, params, local, actions, reverse=False) -> GaussianNatParam:
         """
@@ -269,60 +323,89 @@ class RAMPSSM:
             factors_nat, left, right,
         )
 
-    def _step_factors(self, rec_params, data) -> GaussianNatParam:
+    def get_causal_messages(self, prior_params, factors_nat, actions=None) -> GaussianNatParam:
         """
-        Sum the observation ratios for one online step.
+        Stack observation and left ratios at every latent node.
+        For use in apply() methods only requiring the forward causal beliefs.
 
         Parameters
         ----------
-        rec_params: sequence of length J. Observation-network Flax variable trees.
-        data:       sequence of length J, or one array when J=1. 
-                        Current observation arrays shaped (B,*O_j), without a time axis.
+        prior_params:  Model params. 'forward' and 'backward' message-network parameters.
+        factors_nat:   Observation ratios with pwm=(J,B,T,N), p=(J,B,T,N,N).
+        actions:       (B,T-1,A), (B,T-1) when A=1, or None when A=0. Recorded edge actions.
 
         Returns
         -------
         output: GaussianNatParam
-            Summed local ratio with pwm=(B,N), p=(B,N,N).
+            All incoming causal ratios with pwm=(J+1,B,T,N), p=(J+1,B,T,N,N).
+            The first J branches are observations, followed by left.
         """
-        data = tuple(data) if isinstance(data, (tuple, list)) else (data,)
-        # Reuse get_factors by adding a length-one time axis, then remove it.
-        factors = self.get_factors(rec_params, tuple(x[:, None] for x in data))
-        return tree_map(lambda x: x[:, 0], factors.sum(axis=0))
+        local = factors_nat.sum(axis=0)
+        batch_size, timesteps = local.params['pwm'].shape[:2]
+        actions = self._actions(actions, batch_size, timesteps - 1, local.params['pwm'].dtype)
+        left = self._pass(prior_params['forward'], local, actions)
+        return tree_map(
+            lambda obs, past: jnp.concatenate((obs, past[None]), axis=0),
+            factors_nat, left
+        )
 
-    def initial_distribution(self, params: dict, data) -> GaussianDistParam:
-        """First causal belief: fixed prior plus current observation ratios."""
-        local = self._step_factors(params['rpm'], data)
-        return (self.prior + local).dist_param
+    # def _step_factors(self, rec_params, data) -> GaussianNatParam:
+    #     """
+    #     Sum the observation ratios for one online step.
 
-    def filter(self, params: dict, posterior: GaussianDistParam, action, data):
-        """
-        Advance a filtered marginal with the batch-inference forward network.
+    #     Parameters
+    #     ----------
+    #     rec_params: sequence of length J. Observation-network Flax variable trees.
+    #     data:       sequence of length J, or one array when J=1. 
+    #                     Current observation arrays shaped (B,*O_j), without a time axis.
 
-        posterior is the previous returned belief; reset at episode boundaries.
-        action is on the edge from that state to the current observation.
+    #     Returns
+    #     -------
+    #     output: GaussianNatParam
+    #         Summed local ratio with pwm=(B,N), p=(B,N,N).
+    #     """
+    #     data = tuple(data) if isinstance(data, (tuple, list)) else (data,)
+    #     # Reuse get_factors by adding a length-one time axis, then remove it.
+    #     factors = self.get_factors(rec_params, tuple(x[:, None] for x in data))
+    #     return tree_map(lambda x: x[:, 0], factors.sum(axis=0))
 
-        Parameters
-        ----------
-        params:     Model parameters.
-                        'prior': forward/backward message-network Flax variable trees.
-                        'rpm': sequence of J observation-network Flax variable trees.
-        posterior:  Previous filtered belief with mean=(B,N), cov=(B,N,N).
-        action:     (B,A), (B,) when A=1, or None when A=0.
-                        Action on the edge leading to the new observation.
-        data:       (J, ...) or (...) if J=1. New observation arrays shaped (B,*O_j).
+    # def initial_distribution(self, params: dict, data) -> GaussianDistParam:
+    #     """First causal belief: fixed prior plus current observation ratios."""
+    #     local = self._step_factors(params['rpm'], data)
+    #     return (self.prior + local).dist_param
 
-        Returns
-        -------
-        output: GaussianDistParam
-            Next filtered belief with mean=(B,N), cov=(B,N,N).
-        """
-        ratio = posterior.nat_param - self.prior
-        mean = posterior.params['mean']
-        if action is not None:
-            if action.ndim == 1 and self.action_dim == 1:
-                action = action[:, None]
-            action = action[:, None, :]
-        action = self._actions(action, mean.shape[0], 1, mean.dtype)[:, 0]
-        predicted = self._message(params['prior']['forward'], ratio, action)
-        local = self._step_factors(params['rpm'], data)
-        return (self.prior + predicted + local).dist_param
+    # def filter(self, params: dict, posterior: GaussianDistParam, action, data):
+    #     """
+    #     Advance a filtered marginal with the batch-inference forward network.
+
+    #     posterior is the previous returned belief; reset at episode boundaries.
+    #     action is on the edge from that state to the current observation.
+
+    #     Parameters
+    #     ----------
+    #     params:     Model parameters.
+    #                     'prior': forward/backward message-network Flax variable trees.
+    #                     'rpm': sequence of J observation-network Flax variable trees.
+    #     posterior:  Previous filtered belief with mean=(B,N), cov=(B,N,N).
+    #     action:     (B,A), (B,) when A=1, or None when A=0.
+    #                     Action on the edge leading to the new observation.
+    #     data:       (J, ...) or (...) if J=1. New observation arrays shaped (B,*O_j).
+
+    #     Returns
+    #     -------
+    #     output: GaussianDistParam
+    #         Next filtered belief with mean=(B,N), cov=(B,N,N).
+    #     """
+    #     ratio = posterior.nat_param - self.prior
+    #     mean = posterior.params['mean']
+
+    #     if action is not None:
+    #         if action.ndim == 1 and self.action_dim == 1:
+    #             action = action[:, None]
+    #         action = action[:, None, :]
+
+    #     action = self._actions(action, mean.shape[0], 1, mean.dtype)[:, 0]
+    #     predicted = self._message(params['prior']['forward'], ratio, action)
+    #     local = self._step_factors(params['rpm'], data)
+
+    #     return (self.prior + predicted + local).dist_param
