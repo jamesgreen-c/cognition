@@ -8,28 +8,33 @@ from rp_slac.config import Config
 from rp_slac import distributions
 
 from rp_slac.recognition import networks, distmaps
-from rp_slac.free_energy.ramp_fe import ConstrainedIVFreeEnergy
+from rp_slac.free_energy import model_fe, ramp_fe
 from rp_slac.free_energy.control_fe import ControlFreeEnergy
 from rp_slac.recognition import rpm, ramp 
 
 
 def setup(
-        sequence_length: int,
-        initial_steps: int,
-        latent_dim: int,
-        actor_history: int,
-        action_dim: int,
-        action_low: Array,
-        action_high: Array,
-        batch_size: int,
-        pixels: int,
-        num_buffers: int,
-        pretrain_iter: int,
-        num_iter: int,
-        capacity: int,
-        gamma: float,
-        seed: int,
+    sequence_length: int,
+    initial_steps: int,
+    latent_dim: int,
+    actor_history: int,
+    action_dim: int,
+    action_low: Array,
+    action_high: Array,
+    model_batch_size: int,
+    sac_batch_size: int,
+    pixels: int,
+    num_buffers: int,
+    pretrain_iter: int,
+    num_iter: int,
+    capacity: int,
+    gamma: float,
+    seed: int,
+    kernel: str = "ramp",
 ):
+    if kernel not in ("ramp", "rpssm"):
+        raise ValueError("kernel must be 'ramp' or 'rpssm'.")
+    
     D = latent_dim
     K = action_dim
 
@@ -37,7 +42,8 @@ def setup(
         sequence_length=sequence_length,
         num_pretrain=pretrain_iter,
         num_iter=num_iter,
-        batch_size=batch_size,
+        model_batch_size=model_batch_size,
+        sac_batch_size=sac_batch_size,
         num_buffers=num_buffers,
         actor_history=actor_history,
         initial_steps=initial_steps,
@@ -45,17 +51,17 @@ def setup(
         gamma=gamma,
         actor_state="observation",
         jit=True,
-        stabilise_A=None,
+        stabilise_A="scale" if kernel == "rpssm" else None,
         seed=seed,
         target_update_rate=0.005
     )
 
     # learning rates
-    CFG.prior.lr = 1e-4
-    CFG.recognition.lr = 3e-4
-    CFG.actor.lr = 3e-4
-    CFG.critic.lr = 3e-4
-    CFG.alpha.lr = 3e-4
+    CFG.prior.lr = 1e-3
+    CFG.recognition.lr = 1e-3
+    CFG.actor.lr = 1e-3
+    CFG.critic.lr = 1e-3
+    CFG.alpha.lr = 1e-3
 
     # recognition definition
     last_kernel = (pixels + 15) // 16
@@ -68,27 +74,44 @@ def setup(
     ]
 
     REC = rpm.GaussianRecognition(
-        network=networks.DenseCNN(cnn_features=cnn_features, mlp_features=(256, 256)),
-        dist_map=distmaps.MVNDiag(D),
+        compressor=networks.DenseCNN(cnn_features=cnn_features),
+        network=networks.MLP([256, 256]),
+        dist_map=distmaps.MVNDiag(D, max_precision=1000.0),
         constant_cov=True,
     )
-    RPM = rpm.GaussianRecognition(
-        networks.TanhMLP([128, 128, 128]), 
-        distmaps.MVNCholeskySoftplus(latent_dim)
-    ) 
+    REWARD_NET = rpm.GaussianRecognition(
+        network=networks.MLP([256, 256]),
+        dist_map=distmaps.MVNDiag(1),
+    )
 
     # model definition
-    MODEL = ramp.RAMPSSM(
-        latent_dim=latent_dim,
-        recognition=(REC,),
-        message_network=RPM,
-        action_dim=action_dim,
-    )
-    MODEL_FE = ConstrainedIVFreeEnergy(model=MODEL)
+    if kernel == "ramp":
+        RPM = rpm.GaussianRecognition(
+            network=networks.TanhMLP([256, 256, 256, 256]),
+            dist_map=distmaps.MVNCholeskySoftplus(D, max_chol=10.0),
+        )
+        MODEL = ramp.RAMPSSM(
+            latent_dim=D,
+            recognition=(REC,),
+            message_network=RPM,
+            action_dim=K,
+            reward_network=REWARD_NET,
+        )
+        MODEL_FE = ramp_fe.ConstrainedIVFreeEnergy(model=MODEL)
 
-    # observation-conditioned actor
+    else:
+        # Match the existing RPSSM prior initialisation.
+        PRIOR = distributions.LGStationaryParam(
+            stationary=True, 
+            A=jnp.zeros((D, D)), 
+            B=jnp.ones((D, K)),
+        )
+        MODEL = rpm.RPSSM(prior=PRIOR, recognition=(REC,), reward_network=REWARD_NET)
+        MODEL_FE = model_fe.ConstrainedIVFreeEnergy(model=MODEL)
+
+    # The policy consumes shared encoder features and preceding actions.
     actor_net = actor.ActorNetwork(
-        network=networks.DenseCNN(cnn_features=cnn_features, mlp_features=(256, 256)),
+        network=networks.MLP((256, 256)),
         dist_map=distmaps.SLACMVNDiag(K),
     )
     ACTOR = actor.Actor(
@@ -100,7 +123,7 @@ def setup(
     # latent-action critic
     critic_net = critic.CriticNetwork(network=networks.MLP([256, 256]))
     CRITIC = critic.Critic(network=critic_net)
-    CONTROL_FE = ControlFreeEnergy(actor=ACTOR, critic=CRITIC)
+    CONTROL_FE = ControlFreeEnergy(actor=ACTOR, critic=CRITIC, encoder=MODEL)
 
     return CFG, MODEL_FE, CONTROL_FE
 

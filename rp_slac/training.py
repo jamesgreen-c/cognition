@@ -177,7 +177,8 @@ class RPSLAC:
             self._stabilise_params()
             
             self.pretraining_losses.append(float(loss))
-            pbar.set_postfix(loss=float(loss), reward_mse=float(aux['model']['reward_mse']))
+            # pbar.set_postfix(loss=float(loss), reward_mse=float(aux['model']['reward_mse']))
+            pbar.set_postfix(loss=float(loss), reward_loss=float(aux['model']['reward_nll']))
 
         # run training
         self.model_losses = []
@@ -224,12 +225,13 @@ class RPSLAC:
             self._record_model_statistics(aux['model'])
 
             pbar.set_postfix(
-                average_reward="{:.4f}".format(float(average_reward)),
+                avg_reward="{:.4f}".format(float(average_reward)),
                 model_loss="{:.3f}".format(float(losses["model"])),
                 critic_loss="{:.3f}".format(float(losses["critic"])),
                 actor_loss="{:.3f}".format(float(losses["actor"])),
                 alpha_loss="{:.3f}".format(float(losses["alpha"])),
-                reward_mse="{:.4f}".format(float(aux['model']['reward_mse'])),
+                reward_loss="{:.3f}".format(float(aux['model']['reward_nll'])),
+                # reward_mse="{:.6f}".format(float(aux['model']['reward_mse'])),
             )
 
         return self.params, replay_buffer, env_states, key
@@ -303,12 +305,13 @@ class RPSLAC:
             self._record_model_statistics(aux['model'])
 
             pbar.set_postfix(
-                average_reward="{:.4f}".format(float(average_reward)),
+                avg_reward="{:.4f}".format(float(average_reward)),
                 model_loss="{:.3f}".format(float(losses["model"])),
                 critic_loss="{:.3f}".format(float(losses["critic"])),
                 actor_loss="{:.3f}".format(float(losses["actor"])),
                 alpha_loss="{:.3f}".format(float(losses["alpha"])),
-                reward_mse="{:.4f}".format(float(aux['model']['reward_mse'])),
+                reward_loss="{:.3f}".format(float(aux['model']['reward_nll'])),
+                # reward_mse="{:.6f}".format(float(aux['model']['reward_mse'])),
             )
 
         self.itr = end_itr

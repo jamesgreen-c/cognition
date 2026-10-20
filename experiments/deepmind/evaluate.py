@@ -4,21 +4,22 @@ import os
 
 # ARGS PARSING
 parser = argparse.ArgumentParser()
+parser.add_argument("--kernel", choices=("ramp", "rpssm"), default="ramp")
 parser.add_argument("--domain", type=str, default="cheetah")
 parser.add_argument("--task", type=str, default="run")
-parser.add_argument("--initial-collection", type=int, default=10000)
+parser.add_argument("--initial-collection", type=int, default=2500)
 parser.add_argument("--action-repeat", type=int, default=4)
-parser.add_argument("--actor-history", type=int, default=3)
+parser.add_argument("--actor-history", type=int, default=8)
 parser.add_argument("--N", type=int, default=1)
-parser.add_argument("--D", type=int, default=24)
+parser.add_argument("--D", type=int, default=32)
 parser.add_argument("--T", type=int, default=8)
 parser.add_argument("--pixels", type=int, default=64)
 parser.add_argument("--rgb", action="store_true")
-parser.add_argument("--stabilise", type=str, default="clip")
 parser.add_argument("--gamma", type=float, default=0.99)
-parser.add_argument("--pretrain-iter", type=int, default=3000)
-parser.add_argument("--batch-size", type=int, default=32)
-parser.add_argument("--capacity", type=int, default=2500)
+parser.add_argument("--pretrain-iter", type=int, default=50000)
+parser.add_argument("--model-batch-size", type=int, default=32)
+parser.add_argument("--sac-batch-size", type=int, default=256)
+parser.add_argument("--capacity", type=int, default=100000)
 parser.add_argument("--eval-episodes", type=int, default=10)
 parser.add_argument("--seed", type=int, default=1234)
 parser.add_argument("--verbose-warp", dest="verbose_warp", action="store_true")
@@ -45,6 +46,7 @@ from rp_slac.training import RPSLAC
 
 from experiments.deepmind.data import DmControlEnvironment
 from experiments.deepmind.setup import setup
+from experiments.deepmind.utils import experiment_name, run_configuration
 
 
 ENV = DmControlEnvironment(
@@ -62,13 +64,14 @@ ENV = DmControlEnvironment(
 #  evaluation does not execute the training schedule.
 CONFIG, MODEL_FE, CONTROL_FE = setup(
     sequence_length=args.T,
-    initial_steps=10000,
+    initial_steps=args.initial_collection,
     latent_dim=args.D,
     actor_history=args.actor_history,
     action_dim=ENV.action_lower.shape[0],
     action_low=ENV.action_lower,
     action_high=ENV.action_upper,
-    batch_size=args.batch_size,
+    model_batch_size=args.model_batch_size,
+    sac_batch_size=args.sac_batch_size,
     pixels=args.pixels,
     num_buffers=args.N,
     pretrain_iter=args.pretrain_iter,
@@ -76,14 +79,10 @@ CONFIG, MODEL_FE, CONTROL_FE = setup(
     capacity=args.capacity,
     gamma=args.gamma,
     seed=args.seed,
-    stabilise_A=args.stabilise,
+    kernel=args.kernel,
 )
 
-EXPERIMENT_NAME = (
-    f"domain={args.domain},task={args.task},D={args.D},N={args.N},T={args.T},"
-    f"history={args.actor_history},repeat={args.action_repeat},pretrain={args.pretrain_iter},"
-    f"rgb={args.rgb},pixels={args.pixels},stabilise={args.stabilise},seed={args.seed}"
-)
+EXPERIMENT_NAME = experiment_name(args)
 DIRPATH = Path("results") / EXPERIMENT_NAME
 
 
@@ -96,9 +95,7 @@ def find_checkpoint() -> Path:
             f"Missing checkpoint files in {DIRPATH}: {', '.join(missing)}"
         )
 
-    requested_config = vars(args).copy()
-    for ignored in ("eval_episodes", "platform", "verbose_warp"):
-        requested_config.pop(ignored)
+    requested_config = run_configuration(args)
 
     with (DIRPATH / "run_config.pkl").open("rb") as f:
         saved_config = pickle.load(f)
@@ -125,6 +122,7 @@ def load_trainer(checkpoint_path: Path) -> tuple[RPSLAC, int]:
 
     with (checkpoint_path / "params.pkl").open("rb") as f:
         trainer.params = pickle.load(f)
+    trainer.validate_checkpoint(trainer.params)
     with (checkpoint_path / "loss.pkl").open("rb") as f:
         losses = pickle.load(f)
 
@@ -132,6 +130,8 @@ def load_trainer(checkpoint_path: Path) -> tuple[RPSLAC, int]:
     if any(len(losses[name]) != completed for name in ("critic", "actor", "alpha")):
         raise ValueError(f"Inconsistent training history lengths in {checkpoint_path}.")
 
+    trainer.model.configure(CONFIG)
+    trainer.control.configure(CONFIG, data=None)
     print(f"Loaded checkpoint from {checkpoint_path} ({completed} training steps).")
     return trainer, completed
 
@@ -140,15 +140,12 @@ def evaluate_policy(trainer: RPSLAC, completed: int) -> dict:
     if args.eval_episodes < 1:
         raise ValueError("eval_episodes must be positive.")
 
-    key = jr.PRNGKey(args.seed + 10)
+    key = jr.PRNGKey(args.seed + 11)
     key, initial_key = jr.split(key)
 
     @jax.jit
     def mean_policy_step(params, actor_observation):
-        actor_observation = ENV.preprocess_observation(actor_observation)
-        policy = lambda observation: trainer.control.mean_policy(params, 
-                                                                 observation)
-        return jax.vmap(policy)(actor_observation)
+        return trainer.apply(None, params, actor_observation, deterministic=True)
 
     initial_carry = jax.jit(lambda init_key: ENV.initial_carry(init_key, args.N))
     collect_step = jax.jit(ENV.collect_step)
@@ -157,9 +154,10 @@ def evaluate_policy(trainer: RPSLAC, completed: int) -> dict:
     running_returns = np.zeros(args.N, dtype=np.float64)
     completed_returns = []
 
+    counter = 0
     while len(completed_returns) < args.eval_episodes:
         key, env_key = jr.split(key)
-        actor_observation = ENV.actor_observation(carry)
+        actor_observation = ENV.actor_history_data(carry)
         actions = mean_policy_step(trainer.params, actor_observation)
         carry, _, rewards, flags = collect_step(env_key, carry, actions)
 
@@ -169,9 +167,15 @@ def evaluate_policy(trainer: RPSLAC, completed: int) -> dict:
         completed_returns.extend(running_returns[episode_ends].tolist())
         running_returns[episode_ends] = 0.0
 
+        # counter += 1
+        # if counter % 100 == 0:
+        #     print(counter, len(completed_returns))
+
     episode_returns = np.asarray(completed_returns[: args.eval_episodes], dtype=np.float64)
-    
+    print(episode_returns)
+
     results = {
+        "kernel": args.kernel,
         "num_iter": completed,
         "eval_episodes": args.eval_episodes,
         "episode_returns": episode_returns,

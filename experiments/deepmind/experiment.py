@@ -4,21 +4,23 @@ import argparse
 
 # ARGS PARSING
 parser = argparse.ArgumentParser()
+parser.add_argument("--kernel", choices=("ramp", "rpssm"), default="ramp")
 parser.add_argument("--domain", type=str, default="cheetah")
 parser.add_argument("--task", type=str, default="run")
-parser.add_argument("--initial-collection", type=int, default=10000)
+parser.add_argument("--initial-collection", type=int, default=500)
 parser.add_argument("--action-repeat", type=int, default=4)
-parser.add_argument("--actor-history", type=int, default=3)
+parser.add_argument("--actor-history", type=int, default=8)
 parser.add_argument("--N", type=int, default=1)
-parser.add_argument("--D", type=int, default=24)
+parser.add_argument("--D", type=int, default=32)
 parser.add_argument("--T", type=int, default=8)
 parser.add_argument("--pixels", type=int, default=64)
 parser.add_argument("--rgb", action="store_true")
 parser.add_argument("--gamma", type=float, default=0.99)
 parser.add_argument("--pretrain-iter", type=int, default=3000)
 parser.add_argument("--num-iter", type=int, default=2500)
-parser.add_argument("--batch-size", type=int, default=32)
-parser.add_argument("--capacity", type=int, default=2500)
+parser.add_argument("--model-batch-size", type=int, default=32)
+parser.add_argument("--sac-batch-size", type=int, default=256)
+parser.add_argument("--capacity", type=int, default=10000)
 parser.add_argument("--eval-episodes", type=int, default=10)
 parser.add_argument("--seed", type=int, default=1234)
 parser.add_argument("--continue", dest="continue_run", action="store_true")
@@ -46,7 +48,7 @@ from rp_slac.training import RPSLAC
 
 from experiments.deepmind.data import DmControlEnvironment
 from experiments.deepmind.setup import setup
-from experiments.deepmind.utils import find_checkpoint, load_checkpoint
+from experiments.deepmind.utils import experiment_name, find_checkpoint, load_checkpoint, run_configuration
 
 
 # SETUP
@@ -69,7 +71,8 @@ CONFIG, MODEL_FE, CONTROL_FE = setup(
     action_dim=ENV.action_lower.shape[0],
     action_low=ENV.action_lower,
     action_high=ENV.action_upper,
-    batch_size=args.batch_size,
+    model_batch_size=args.model_batch_size,
+    sac_batch_size=args.sac_batch_size,
     pixels=args.pixels,
     num_buffers=args.N,
     pretrain_iter=args.pretrain_iter,
@@ -77,17 +80,13 @@ CONFIG, MODEL_FE, CONTROL_FE = setup(
     capacity=args.capacity,
     gamma=args.gamma,
     seed=args.seed,
+    kernel=args.kernel,
 )
 
 
 # create results directory
-EXPERIMENT_NAME = (
-    f"domain={args.domain},task={args.task},D={args.D},N={args.N},T={args.T},"
-    f"history={args.actor_history},repeat={args.action_repeat},pretrain={args.pretrain_iter},"
-    f"rgb={args.rgb},pixels={args.pixels},stabilise={args.stabilise},seed={args.seed}"
-)
+EXPERIMENT_NAME = experiment_name(args)
 DIRPATH = f"results/{EXPERIMENT_NAME}"
-
 
 
 def main():
@@ -98,12 +97,13 @@ def main():
         environment=ENV, 
         config=CONFIG
     )
+
     if args.continue_run:
+
         checkpoint_path = find_checkpoint(DIRPATH, args)
         params, replay_buffer, env_states, opts, opt_states, key, completed = load_checkpoint(trainer, checkpoint_path, args)
 
         print(f"Continuing {checkpoint_path} from step {completed} to {completed + args.num_iter}.")
-
         _, replay_buffer, env_states, key = trainer.train_continue(replay_buffer, 
                                                                    env_states, 
                                                                    params, 
@@ -121,9 +121,7 @@ def main():
     if not os.path.exists(DIRPATH):
         os.makedirs(DIRPATH, exist_ok=True)
 
-    run_config = vars(args).copy()
-    for ignored in ("num_iter", "continue_run", "eval_episodes", "debug", "platform", "verbose_warp"):
-        run_config.pop(ignored)
+    run_config = run_configuration(args)
 
     checkpoint = {
         "params.pkl": trainer.params,
@@ -141,6 +139,7 @@ def main():
         "buffer.pkl": replay_buffer,
         "rewards.pkl": trainer.average_rewards,
         "log_alphas.pkl": trainer.alpha_hist,
+        "model_stats.pkl": trainer.model_stats,
         "actor_stats.pkl": {
             "mean": np.array([stat["mean"] for stat in trainer.actor_stats]),
             "std": np.array([stat["std"] for stat in trainer.actor_stats]),
@@ -162,4 +161,5 @@ def main():
 
 
 if __name__ == "__main__":
+    print(f"Executing: {EXPERIMENT_NAME}")
     trainer = main()
