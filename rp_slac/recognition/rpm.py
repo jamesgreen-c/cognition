@@ -10,7 +10,7 @@ from jax import vmap, Array
 from rp_slac.recognition.distmaps import DistMap
 from rp_slac.config import Config
 from rp_slac.distributions import LGStationaryParam, AllParams, NetworkParams
-from rp_slac.utils.kalman import parallel_filter
+from rp_slac.utils.kalman import parallel_filter, parallel_smoother
 
 
 INITIALIZER = jax.nn.initializers.variance_scaling(
@@ -20,6 +20,7 @@ INITIALIZER = jax.nn.initializers.variance_scaling(
 class GaussianRecognition(nn.Module):
     network: nn.Module
     dist_map: DistMap
+    compressor: nn.Module | None = None
     kernel_init: Callable = INITIALIZER
     bias_init: Callable = jax.nn.initializers.zeros
     constant_cov: bool = (
@@ -28,13 +29,13 @@ class GaussianRecognition(nn.Module):
 
     def encode(self, x: Array) -> Array:
         """Shared observation features, before the Gaussian recognition head."""
-        return self.network(x)
+        return self.compressor(x) if self.compressor is not None else x
 
     @nn.compact
     def __call__(self, x: Array, return_features: bool = False):
 
         features = self.encode(x)
-        x = features
+        x = self.network(features)
         
         if self.constant_cov:
             mean_dim = self.dist_map.latent_dim
