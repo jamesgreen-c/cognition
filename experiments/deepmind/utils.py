@@ -1,6 +1,23 @@
 from pathlib import Path
 import pickle
 
+EXPERIMENT_VERSION = 'ramp-reward-v2'
+
+
+def experiment_name(args):
+    """Use the same kernel-specific checkpoint directory in every entry point."""
+    return (
+        f"kernel={args.kernel},domain={args.domain},task={args.task},D={args.D},N={args.N},T={args.T},"
+        f"history={args.actor_history},repeat={args.action_repeat},pretrain={args.pretrain_iter},"
+        f"rgb={args.rgb},pixels={args.pixels},seed={args.seed}"
+    )
+
+
+def run_configuration(args):
+    """Settings that must match when resuming or evaluating a checkpoint."""
+    ignored = {"num_iter", "continue_run", "eval_episodes", "debug", "platform", "verbose_warp"}
+    return {name: value for name, value in vars(args).items() if name not in ignored}
+
 #
 def find_checkpoint(dirpath: str, args):
     """Find the checkpoint for this experiment's stable directory name."""
@@ -12,9 +29,7 @@ def find_checkpoint(dirpath: str, args):
     if missing:
         raise FileNotFoundError(f"Missing checkpoint files in {path}: {', '.join(missing)}")
 
-    requested_config = vars(args).copy()
-    for ignored in ("num_iter", "continue_run", "eval_episodes", "debug", "platform", "verbose_warp"):
-        requested_config.pop(ignored)
+    requested_config = run_configuration(args)
 
     
     metadata_path = path / "run_config.pkl"
@@ -32,6 +47,7 @@ def load_checkpoint(trainer, path, args):
             return pickle.load(f)
 
     params = read("params.pkl")
+    trainer.validate_checkpoint(params)
     replay_buffer = read("buffer.pkl")
     opt_states = read("opt_states.pkl")
     opts = read("opts.pkl")
@@ -44,6 +60,12 @@ def load_checkpoint(trainer, path, args):
     trainer.critic_losses = losses["critic"]
     trainer.actor_losses = losses["actor"]
     trainer.alpha_losses = losses["alpha"]
+
+    stats_path = path / 'model_stats.pkl'
+    trainer.model_stats = read('model_stats.pkl') if stats_path.is_file() else {}
+    
+    if any(len(values) != completed for values in trainer.model_stats.values()):
+        raise ValueError(f'Inconsistent model diagnostic history lengths in {path}.')
 
     trainer.average_rewards = read("rewards.pkl")
     trainer.alpha_hist = read("log_alphas.pkl")
