@@ -293,10 +293,25 @@ class MuJoCoSimulationEnvironment(ABC):
         return jnp.where(condition.reshape(shape), true_value, false_value)
 
     def random_action(self, key: PRNGKey, observation: Array) -> tuple[Array, Array]:
+        # del observation
+        # lower, upper = self._action_bounds()
+        # action = jr.uniform(key, shape=lower.shape, minval=lower, maxval=upper)
+        # log_prob = -jnp.log(upper - lower).sum()
+        # return action, log_prob
         del observation
         lower, upper = self._action_bounds()
-        action = jr.uniform(key, shape=lower.shape, minval=lower, maxval=upper)
-        log_prob = -jnp.log(upper - lower).sum()
+        scale = (upper - lower) / 2.0
+        bias = (upper + lower) / 2.0
+
+        raw_action = 2.0 * jr.normal(key, shape=lower.shape, dtype=lower.dtype)
+        action = bias + scale * jnp.tanh(raw_action)
+
+        # Gaussian density and stable tanh/affine change-of-variables terms.
+        log_base = -0.5 * (raw_action / 2.0)**2 - jnp.log(2.0) - 0.5 * jnp.log(2.0 * jnp.pi)
+        log_det_tanh = 2.0 * (
+            jnp.log(2.0) - raw_action - jnp.logaddexp(0.0, -2.0 * raw_action)
+        )
+        log_prob = jnp.sum(log_base - log_det_tanh - jnp.log(scale))
         return action, log_prob
 
     def preprocess_observation(self, observation: Array) -> Array:
